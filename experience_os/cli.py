@@ -75,6 +75,12 @@ def main(argv: list[str] | None = None) -> int:
     cmp_parser.add_argument("--solo", action="store_true")
     cmp_parser.add_argument("--no-validation", action="store_true", help="ablation: skip harness validation")
     cmp_parser.add_argument("--no-versioning", action="store_true", help="ablation: disable versioning")
+    cmp_parser.add_argument("--variant", default="type_split",
+                            choices=["type_split", "replay", "cross_domain"],
+                            help="experiment design variant")
+    cmp_parser.add_argument("--cross-domain", default="",
+                            help="for cross_domain variant: domain to accumulate on")
+    cmp_parser.add_argument("--experiment-id", default="", help="override experiment ID")
     cmp_parser.add_argument("--output", default="", help="output JSON path")
 
     curve_parser = sub.add_parser("curve", help="plot accumulation curve from result JSONs")
@@ -82,6 +88,9 @@ def main(argv: list[str] | None = None) -> int:
     curve_parser.add_argument("--output", default="docs/exp_results/curve.png")
     curve_parser.add_argument("--warmup-split", type=int, default=0)
     curve_parser.add_argument("--window", type=int, default=3)
+    curve_parser.add_argument("--cost", action="store_true", help="plot cost convergence instead")
+
+    sub.add_parser("lts", help="list all experiments in the LTS store")
 
     tau2_parser = sub.add_parser("tau2-demo", help="run τ-bench integration demo")
     tau2_parser.add_argument("--domain", default="retail", help="τ-bench domain")
@@ -134,17 +143,37 @@ def main(argv: list[str] | None = None) -> int:
             solo_mode=args.solo,
             skip_validation=args.no_validation,
             no_versioning=args.no_versioning,
+            variant=args.variant,
+            cross_domain=args.cross_domain,
+            experiment_id=args.experiment_id,
         )
         if args.output:
             save_result(exp, args.output)
         return 0
     if args.command == "curve":
-        from experience_os.experiments.curve import plot_curve
+        from experience_os.experiments.curve import plot_cost_curve, plot_curve
 
-        plot_curve(
-            args.inputs, output=args.output,
-            warmup_split=args.warmup_split or None, window=args.window,
-        )
+        if args.cost:
+            plot_cost_curve(args.inputs, output=args.output, window=args.window)
+        else:
+            plot_curve(
+                args.inputs, output=args.output,
+                warmup_split=args.warmup_split or None, window=args.window,
+            )
+        return 0
+    if args.command == "lts":
+        from experience_os.lts import LTSStore
+        store = LTSStore()
+        exps = store.experiments()
+        if not exps:
+            print("(LTS 为空)")
+            return 0
+        print(f"{'experiment_id':<40} {'method':<12} {'domain':<10} {'ok/n':<8} {'tokens'}")
+        print("-" * 80)
+        for e in exps:
+            print(f"{e['experiment_id']:<40} {e['method']:<12} {e['domain']:<10} "
+                  f"{e['successes']}/{e['tasks']:<7} {e['tokens']:,}")
+        store.close()
         return 0
     if args.command == "env-info":
         from experience_os.env_info import collect_env_info, print_env_info, save_env_info

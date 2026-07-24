@@ -543,6 +543,38 @@ ORDER BY version;
 4. **指标**：Task Success Rate、Avg Tokens/Task、Avg Latency、Harness Hit Rate（D 独有）。
 5. **核心图表**：积累曲线图（x=任务序号，y=滚动成功率），展示 AutoHarness 在第 K+1 个任务后的"交叉超越"。
 
+### 6.4 实验设计变体（归纳证据来源）
+
+核心方法学问题：**归纳的素材来自哪里、验证在哪上面做？** 三种变体 + 临场/预积累维度：
+
+| 变体 | 积累池 | 验证池 | 测什么 | CLI |
+|------|--------|--------|--------|-----|
+| **type_split**（默认） | 同类型前 K 个 | 同类型剩余 | 类型内泛化（未见实例） | `--variant type_split` |
+| **replay** | 同类型前 K 个 | **同一批**重跑 | 记忆 vs 泛化（上界） | `--variant replay` |
+| **cross_domain** | domain X（如 airline） | domain Y（如 retail） | 跨域迁移 | `--variant cross_domain --cross-domain airline` |
+
+**临场 vs 预积累维度**：
+- **临场（online）**：在 eval 流中边跑边积累，harness 在第 K+1 个任务后"上线"——`autoharness` 方法即此。
+- **预积累（pre-accumulated）**：warm-up 阶段先单独跑完并归纳，再进 eval 流——`autoharness` 的 warmup/eval 分离即此。
+
+两种维度可正交组合。`type_split + 预积累` 是主实验；`replay` 给上界；`cross_domain` 测迁移鲁棒性。
+
+### 6.5 LTS 经验库（持久底座）
+
+[lts.py](file:///home/our0boros/Project/ExecutableExperience/experience_os/lts.py) 在四层 Repository 之下提供**append-only 原始交互日志**：
+
+- **只追加**：每次执行（method、domain、task、success、tokens、latency、path、轨迹）都写入 SQLite `lts_log`，永不修改。
+- **跨实验共享**：所有实验写同一 LTS，用 `experiment_id` 隔离。`experience-os lts` 列出全部实验。
+- **与归纳解耦**：LTS 只记录"发生了什么"，不关心是否被归纳利用。上层换任意归纳方案（code/text/AST）都不影响底座。
+- **实验内经验库**：每个实验除写 LTS 外，仍维护自己的 ephemeral Repository（`.experience_os_data/`），实验结束可丢弃，原始数据留在 LTS。
+
+### 6.6 成本收敛接口
+
+回答"经验积累是否让成本收敛"：
+- `LTSStore.cost_curve(experiment_id)` 返回 `{x, rolling_sr, cumulative_tokens, rolling_avg_tokens}`。
+- `experience-os curve --cost <files>` 绘制双轴图：累计 token（上）+ 滚动平均 token（下）。AutoHarness 在 harness 命中后 rolling_avg 应骤降。
+- 当前 `runtime.py:197` 的 `estimated_token_savings` 用硬编码 1000 估算，LTS 用真实 per-task token 替代。
+
 ---
 
 ## 7. 差距修复路线图

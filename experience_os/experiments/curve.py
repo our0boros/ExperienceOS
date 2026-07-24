@@ -100,6 +100,82 @@ def plot_curve(result_files: list[str], output: str = "docs/exp_results/curve.pn
     return str(out_path)
 
 
+def plot_cost_curve(
+    result_files: list[str],
+    output: str = "docs/exp_results/cost_curve.png",
+    window: int = 3,
+) -> str:
+    """绘制成本收敛曲线：累计 token + 滚动平均 token。
+
+    用于回答"经验积累是否让成本收敛"——autoharness 在 harness 命中后
+    token 应骤降，rolling_avg 收敛到低位。
+    """
+    series = []
+    for rf in result_files:
+        d = json.loads(Path(rf).read_text())
+        tokens = [r["tokens"] for r in d["results"]]
+        cum, s = [], 0
+        for t in tokens:
+            s += t
+            cum.append(s)
+
+        def _rolling(vals, w):
+            out = []
+            for i in range(len(vals)):
+                lo = max(0, i - w + 1)
+                chunk = vals[lo: i + 1]
+                out.append(sum(chunk) / len(chunk))
+            return out
+
+        series.append({
+            "method": d["method"],
+            "x": list(range(1, len(tokens) + 1)),
+            "cumulative": cum,
+            "rolling_avg": _rolling(tokens, window),
+        })
+
+    out_path = Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
+        for s in series:
+            ax1.plot(s["x"], s["cumulative"], marker="o", ms=3, label=s["method"])
+            ax2.plot(s["x"], s["rolling_avg"], marker="o", ms=3, label=s["method"])
+        ax1.set_ylabel("Cumulative tokens")
+        ax1.set_title("Cost convergence: cumulative token cost")
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        ax2.set_xlabel("Task index")
+        ax2.set_ylabel(f"Rolling avg tokens (window={window})")
+        ax2.set_title("Per-task token cost (lower = cheaper)")
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+        print(f"成本曲线已保存: {out_path}")
+    except ImportError:
+        log.warning("matplotlib 不可用，成本曲线输出 CSV")
+        csv_path = out_path.with_suffix(".csv")
+        import csv as _csv
+        with csv_path.open("w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["idx", "method", "cumulative_tokens", "rolling_avg_tokens"])
+            max_len = max(len(s["cumulative"]) for s in series)
+            for i in range(max_len):
+                for s in series:
+                    if i < len(s["cumulative"]):
+                        w.writerow([i + 1, s["method"],
+                                   s["cumulative"][i], s["rolling_avg"][i]])
+        print(f"成本曲线 CSV: {csv_path}")
+        out_path = csv_path
+    return str(out_path)
+
+
 def _sparkline(series: list[dict]) -> None:
     chars = " ▂▃▄▅▆▇█"
     print("\n滚动成功率预览：")

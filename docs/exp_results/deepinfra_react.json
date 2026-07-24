@@ -1,0 +1,98 @@
+{
+  "method": "react",
+  "model": "deepinfra/MiniMaxAI/MiniMax-M2.7",
+  "domain": "retail",
+  "task_type": "find_user_id_by_email",
+  "warmup_size": 3,
+  "eval_size": 3,
+  "max_steps": 12,
+  "results": [
+    {
+      "idx": 1,
+      "phase": "warmup",
+      "task_id": "10",
+      "task_type": "find_user_id_by_email",
+      "method": "react",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 0.05817151069641113,
+      "path": "agent",
+      "error": "litellm.InternalServerError: InternalServerError: DeepinfraException - Missing credentials. Please pass an `api_key`, `workload_identity`, `admin_api_key`, or set the `DEEPINFRA_API_KEY` or `DEEPINFRA"
+    },
+    {
+      "idx": 2,
+      "phase": "warmup",
+      "task_id": "11",
+      "task_type": "find_user_id_by_email",
+      "method": "react",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 0.039267539978027344,
+      "path": "agent",
+      "error": "litellm.InternalServerError: InternalServerError: DeepinfraException - Missing credentials. Please pass an `api_key`, `workload_identity`, `admin_api_key`, or set the `DEEPINFRA_API_KEY` or `DEEPINFRA"
+    },
+    {
+      "idx": 3,
+      "phase": "warmup",
+      "task_id": "12",
+      "task_type": "find_user_id_by_email",
+      "method": "react",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 0.037930965423583984,
+      "path": "agent",
+      "error": "litellm.InternalServerError: InternalServerError: DeepinfraException - Missing credentials. Please pass an `api_key`, `workload_identity`, `admin_api_key`, or set the `DEEPINFRA_API_KEY` or `DEEPINFRA"
+    },
+    {
+      "idx": 4,
+      "phase": "eval",
+      "task_id": "13",
+      "task_type": "find_user_id_by_email",
+      "method": "react",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 0.03839683532714844,
+      "path": "agent",
+      "error": "litellm.InternalServerError: InternalServerError: DeepinfraException - Missing credentials. Please pass an `api_key`, `workload_identity`, `admin_api_key`, or set the `DEEPINFRA_API_KEY` or `DEEPINFRA"
+    },
+    {
+      "idx": 5,
+      "phase": "eval",
+      "task_id": "14",
+      "task_type": "find_user_id_by_email",
+      "method": "react",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 0.06972193717956543,
+      "path": "agent",
+      "error": "litellm.InternalServerError: InternalServerError: DeepinfraException - Missing credentials. Please pass an `api_key`, `workload_identity`, `admin_api_key`, or set the `DEEPINFRA_API_KEY` or `DEEPINFRA"
+    },
+    {
+      "idx": 6,
+      "phase": "eval",
+      "task_id": "35",
+      "task_type": "find_user_id_by_email",
+      "method": "react",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 0.03982806205749512,
+      "path": "agent",
+      "error": "litellm.InternalServerError: InternalServerError: DeepinfraException - Missing credentials. Please pass an `api_key`, `workload_identity`, `admin_api_key`, or set the `DEEPINFRA_API_KEY` or `DEEPINFRA"
+    }
+  ],
+  "experiment_id": "react-retail-type_split-c113a187",
+  "summary": {
+    "total": 6,
+    "successes": 0,
+    "success_rate": 0.0,
+    "total_tokens": 0,
+    "avg_latency": 0.05,
+    "eval_success_rate": 0.0
+  }
+}

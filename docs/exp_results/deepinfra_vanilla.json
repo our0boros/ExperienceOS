@@ -1,0 +1,98 @@
+{
+  "method": "vanilla",
+  "model": "deepinfra/MiniMaxAI/MiniMax-M2.7",
+  "domain": "retail",
+  "task_type": "find_user_id_by_email",
+  "warmup_size": 3,
+  "eval_size": 3,
+  "max_steps": 15,
+  "results": [
+    {
+      "idx": 1,
+      "phase": "warmup",
+      "task_id": "10",
+      "task_type": "find_user_id_by_email",
+      "method": "vanilla",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 114.67779231071472,
+      "path": "agent",
+      "error": "Error code: 429 - {'error': {'message': 'Model busy, retry later', 'type': 'invalid_request_error', 'param': None, 'code': 'engine_overloaded'}}"
+    },
+    {
+      "idx": 2,
+      "phase": "warmup",
+      "task_id": "11",
+      "task_type": "find_user_id_by_email",
+      "method": "vanilla",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 108,
+      "latency": 290.138249874115,
+      "path": "agent",
+      "error": "no_match_or_bad_calls"
+    },
+    {
+      "idx": 3,
+      "phase": "warmup",
+      "task_id": "12",
+      "task_type": "find_user_id_by_email",
+      "method": "vanilla",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 154.8293194770813,
+      "path": "agent",
+      "error": "Connection error."
+    },
+    {
+      "idx": 4,
+      "phase": "eval",
+      "task_id": "13",
+      "task_type": "find_user_id_by_email",
+      "method": "vanilla",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 10,
+      "latency": 4.246657609939575,
+      "path": "agent",
+      "error": "no_match_or_bad_calls"
+    },
+    {
+      "idx": 5,
+      "phase": "eval",
+      "task_id": "14",
+      "task_type": "find_user_id_by_email",
+      "method": "vanilla",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 22,
+      "latency": 8.860933065414429,
+      "path": "agent",
+      "error": "no_match_or_bad_calls"
+    },
+    {
+      "idx": 6,
+      "phase": "eval",
+      "task_id": "35",
+      "task_type": "find_user_id_by_email",
+      "method": "vanilla",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 170,
+      "latency": 15.159269571304321,
+      "path": "agent",
+      "error": "no_match_or_bad_calls"
+    }
+  ],
+  "experiment_id": "vanilla-retail-type_split-15407812",
+  "summary": {
+    "total": 6,
+    "successes": 0,
+    "success_rate": 0.0,
+    "total_tokens": 310,
+    "avg_latency": 97.99,
+    "eval_success_rate": 0.0
+  }
+}

@@ -27,9 +27,12 @@ import json
 import logging
 import shutil
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+from experience_os.tau2_adapter import infer_task_type
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +65,11 @@ class ExperimentResult:
     eval_size: int
     max_steps: int
     results: list[TaskResult] = field(default_factory=list)
+    experiment_id: str = ""  # LTS 关联 ID
+
+    def __post_init__(self) -> None:
+        if not self.experiment_id:
+            self.experiment_id = f"{self.method}-{self.domain}-{uuid.uuid4().hex[:8]}"
 
     @property
     def total(self) -> int:
@@ -427,6 +435,9 @@ def run_experiment(
     *,
     skip_validation: bool = False,
     no_versioning: bool = False,
+    variant: str = "type_split",
+    cross_domain: str = "",
+    experiment_id: str = "",
 ) -> ExperimentResult:
     """运行单方法对照实验。
 
@@ -435,18 +446,46 @@ def run_experiment(
         model: litellm 模型名（``ollama/qwen2.5:7b`` / ``deepinfra/...``）
         warmup: warm-up 池大小（仅 autoharness 用于积累）
         eval_size: 评估池大小
+        variant: 实验设计变体：
+            * ``type_split``  — 同任务类型拆分积累/验证池（默认）
+            * ``replay``      — 同任务既积累又验证（重跑，上界）
+            * ``cross_domain``— cross_domain 上积累，domain 上验证（跨域迁移）
     """
     print(f"\n{'='*60}")
     print(f"  对照实验: {method}  model={model}  domain={domain}")
     print(f"  warmup={warmup} eval={eval_size} max_steps={max_steps} solo={solo_mode}")
+    print(f"  variant={variant}" + (f" cross_domain={cross_domain}" if cross_domain else ""))
     print(f"{'='*60}\n")
 
     tasks = load_tasks(domain)
     group, chosen_type = pick_task_group(tasks, task_type, warmup)
     print(f"  任务类型: {chosen_type} ({len(group)} 个)")
 
+    # --- 实验设计变体决定 warmup/eval 任务集 ---
+    if variant == "replay":
+        # 同任务既积累又验证：warmup 和 eval 用相同任务
+        warmup_tasks = group[:warmup]
+        eval_tasks = group[:eval_size]  # 重跑同一批
+    elif variant == "cross_domain" and cross_domain:
+        # 跨域：cross_domain 上积累，domain 上验证
+        cd_tasks = load_tasks(cross_domain)
+        cd_group, cd_type = pick_task_group(cd_tasks, task_type, warmup)
+        warmup_tasks = cd_group[:warmup]
+        # eval 用目标域同类型任务（类型名需一致，否则退化到任意）
+        eval_tasks = group[:eval_size]
+        print(f"  跨域积累: {cross_domain}/{cd_type} ({len(warmup_tasks)} 个) → 验证: {domain}")
+    else:  # type_split (default)
+        warmup_tasks = group[:warmup]
+        eval_tasks = group[warmup: warmup + eval_size]
+
+    stream = warmup_tasks + eval_tasks
+
+    eid = experiment_id or f"{method}-{domain}-{variant}-{uuid.uuid4().hex[:8]}"
+    # 初始化 LTS（跨实验持久底座）
+    from experience_os.lts import LTSStore, LTSEntry
+    lts = LTSStore()
+
     results: list[TaskResult] = []
-    stream = group[: warmup + eval_size]
 
     if method == "autoharness":
         results = run_autoharness(
@@ -465,16 +504,38 @@ def run_experiment(
             r.idx = i
             r.phase = phase
             results.append(r)
+            lts.log(LTSEntry(
+                experiment_id=eid, method=method, domain=domain,
+                task_id=task.id, task_type=infer_task_type(task),
+                idx=i, phase=phase, success=r.success, reward=r.reward,
+                tokens=r.tokens, latency=r.latency, path=r.path,
+                meta={"variant": variant, "model": model},
+            ))
             tag = "✓" if r.success else "✗"
             print(f"  [{i}/{len(stream)}] {phase} {r.task_id} {tag} "
                   f"reward={r.reward:.2f} tokens={r.tokens} {r.error[:40]}")
 
+    # autoharness 也写入 LTS
+    if method == "autoharness":
+        from experience_os.tau2_adapter import infer_task_type as _itt
+        for r in results:
+            lts.log(LTSEntry(
+                experiment_id=eid, method=method, domain=domain,
+                task_id=r.task_id, task_type=r.task_type,
+                idx=r.idx, phase=r.phase, success=r.success, reward=r.reward,
+                tokens=r.tokens, latency=r.latency, path=r.path,
+                meta={"variant": variant, "model": model},
+            ))
+
     exp = ExperimentResult(
         method=method, model=model, domain=domain, task_type=chosen_type,
         warmup_size=warmup, eval_size=eval_size, max_steps=max_steps,
-        results=results,
+        results=results, experiment_id=eid,
     )
     _print_summary(exp)
+    print(f"  experiment_id: {eid}")
+    print(f"  LTS: {lts.query(experiment_id=eid).__len__()} 条记录已持久化")
+    lts.close()
     return exp
 
 
