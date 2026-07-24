@@ -493,3 +493,103 @@ ORDER BY version;
 - 需要结构化查询（"找所有 ACTIVE 的 Harness"）
 - SQLite 的事务性保证一致性
 - 向量 BLOB 需要数据库存储
+
+---
+
+## 6. Baseline 对照实验设计
+
+### 6.1 对照组总览
+
+在 τ-bench（retail/airline）上对比四条路线，**统一 backbone 模型 + 统一 Warm-up 数据**，仅改变"如何利用历史经验"：
+
+| 代号 | 方法 | 经验形态 | 部署时改变什么 | 公平性约束 |
+|------|------|---------|---------------|-----------|
+| **A. Vanilla LLM** | 纯 LLM via DeepInfra，无工具/无记忆 | 无 | 输入分布 | 任务难度下界 |
+| **B. ReAct Agent** | [agent.py](file:///home/our0boros/Project/ExecutableExperience/experience_os/agent.py) 的 ReAct 工具调用，无积累 | 无 | 工具集 | 当前主流范式 |
+| **C. SkillOpt** | 微软 [SkillOpt](https://github.com/microsoft/SkillOpt) 优化的 `best_skill.md` 文本技能 | **文本 skill 文档**（300–2000 token） | LLM 输入 prompt | 最强对照（§7 prior work） |
+| **D. AutoHarness (ours)** | ExperienceOS 编译的可执行 `procedure_code` | **可执行代码 artifact** | 计算路径（绕过 LLM 推理） | 本文方案 |
+
+**关键区分**：SkillOpt 优化的是 *skill 文本*（改 LLM 输入），AutoHarness 编译的是 *可执行代码*（改计算路径，Harness 执行阶段绕过 LLM）。两者用同一 backbone（DeepInfra/MiniMax-M2.7）+ 同一 Warm-up 池，对比"经验形态"本身的差异——这是论文相对 RAG/SkillOpt 的核心论证点。
+
+### 6.2 各 Baseline 集成路径
+
+#### A. 纯 LLM (DeepInfra)
+- 复用 [baseline_eval.py](file:///home/our0boros/Project/ExecutableExperience/experience_os/baseline_eval.py) 的 `run_baseline()`，固定 `max_steps`、禁用工具调用、直接让 LLM 给出最终答案。
+- 已有：DeepInfra 后端配置（`EOS_LLM_BACKEND=deepinfra`）。
+- 缺：需在 baseline_eval 增加 `--no-tools` 模式与 reward 统计。
+
+#### B. ReAct Agent
+- 即 [agent.py](file:///home/our0boros/Project/ExecutableExperience/experience_os/agent.py) 的 `AgentFallback`，ACCUMULATION 模式全量运行。
+- 已具备。只需固定 Warm-up/Eval 池，输出 token + 成功率。
+
+#### C. SkillOpt
+- 作为 submodule 引入 `microsoft/SkillOpt`（同 harbor/tau2-bench 处理方式）。
+- SkillOpt 的 benchmark 是 `skillopt/envs/<name>/` 包（adapter + data loader + scored rollout + YAML）。τ-bench **不在其内置 6 个 benchmark 内**，需写一个 `skillopt/envs/tau2/` adapter：
+  - data loader：复用 [tau2_adapter.py](file:///home/our0boros/Project/ExecutableExperience/experience_os/tau2_adapter.py) 的 `infer_task_type` + `split_tasks`
+  - scored rollout：复用 tau2 的 `reward` 判定
+  - seed skill：空 `best_skill.md`
+- 训练用 DeepInfra/MiniMax-M2.7（与 ExperienceOS 同 backbone），Warm-up 池作为训练数据，产出 `best_skill.md` 后在 Eval 池评测。
+- 风险：SkillOpt 优化 skill 文本，可能对 τ-bench 的多轮 policy 推理增益有限——这恰好是 AutoHarness "可执行代码" 的对比卖点。
+
+#### D. AutoHarness
+- 即本框架 DEPLOYMENT 模式。需先在 Warm-up 池跑 ACCUMULATION 触发归纳，再在 Eval 池用 Harness + Agent fallback。
+- 缺口见 §7。
+
+### 6.3 实验协议（防数据泄露）
+
+1. **数据划分**：复用 [tau2_adapter.split_tasks()](file:///home/our0boros/Project/ExecutableExperience/experience_os/tau2_adapter.py)，按任务类型分组，每类取前 K=3 进 Warm-up，剩余进 Eval，**实例不重叠**。
+2. **同 Warm-up 数据**：C/SkillOpt 用 Warm-up 轨迹做 skill 训练语料；D/AutoHarness 用其做归纳素材；B/ReAct 不使用历史。
+3. **同 Eval 序列**：四组面对完全相同的 Eval 任务顺序。
+4. **指标**：Task Success Rate、Avg Tokens/Task、Avg Latency、Harness Hit Rate（D 独有）。
+5. **核心图表**：积累曲线图（x=任务序号，y=滚动成功率），展示 AutoHarness 在第 K+1 个任务后的"交叉超越"。
+
+---
+
+## 7. 差距修复路线图
+
+按"重要性 × 难易度"排序，分三阶段推进。重要性 = 对论文核心论证的贡献；难易度 = 工程量与依赖复杂度。
+
+### 阶段一：打通对照实验（高价值 / 中低难度）
+
+| # | 任务 | 重要性 | 难度 | 依赖 | 产出 |
+|---|------|-------|------|------|------|
+| 1.1 | baseline_eval 增加 `--no-tools` 纯 LLM 模式 + 统一输出 | 高 | 低 | A | Vanilla 下界 |
+| 1.2 | 固化 ReAct Baseline 脚本（Warm-up/Eval 分池 + 指标导出） | 高 | 低 | B | ReAct 对照 |
+| 1.3 | 引入 SkillOpt submodule + 写 `skillopt/envs/tau2/` adapter | 高 | 中 | C | 最强对照 |
+| 1.4 | 实现积累曲线图（x=任务序号，y=滚动成功率/Token） | 高 | 低 | 1.2/1.3 | 论文核心图 |
+| 1.5 | 消融开关：`--no-validation` / `--no-versioning` / `MIN_SUPPORT={1,3,5}` | 高 | 低 | D | 消融表 |
+
+### 阶段二：补强归纳算法（高价值 / 中高难度）
+
+| # | 任务 | 重要性 | 难度 | 现状 | 产出 |
+|---|------|-------|------|------|------|
+| 2.1 | Phase 1 分段结果真正使用（当前 [compiler.py:349](file:///home/our0boros/Project/ExecutableExperience/experience_os/compiler.py#L349) 丢弃返回值） | 高 | 中 | 占位 | 多步轨迹可分段归纳 |
+| 2.2 | Phase 3 不变量挖掘替换为 Daikon 风格跨轨迹谓词交集 | 高 | 高 | 仅"首步一致+全成功" | 真正的不变量 |
+| 2.3 | Phase 4 参数化改为 LCS + 类型感知（非正则替换引号串） | 高 | 中 | 正则启发式 | 真实多步轨迹可用 |
+| 2.4 | 实现 NEEDS_REVISION 修复循环（失败模式分析 → 重合成） | 中 | 中 | DRAFT 后不重试 | 归纳鲁棒性 |
+| 2.5 | 充实 StructuredCoT（[agent.py:115](file:///home/our0boros/Project/ExecutableExperience/experience_os/agent.py#L115) 仅填 goal） | 中 | 中 | 字段全空 | 归纳信号质量 |
+
+### 阶段三：架构完善（中低价值 / 中难度）
+
+| # | 任务 | 重要性 | 难度 | 现状 | 产出 |
+|---|------|-------|------|------|------|
+| 3.1 | Repository 真正接入 Storage（SQLite），当前仅 embedding.py 用，[repository.py](file:///home/our0boros/Project/ExecutableExperience/experience_os/repository.py) 仍纯 JSON | 中 | 中 | 与 §5 描述不符 | 结构化查询 + 向量 BLOB 落地 |
+| 3.2 | 失败分类 F1-F4 从关键字匹配升级为结构化判定 | 中 | 低 | [agent.py:194](file:///home/our0boros/Project/ExecutableExperience/experience_os/agent.py#L194) 关键字 | 分类准确率 |
+| 3.3 | 特化分裂触发（F1 累积 + `pending_variations` + 环境变异维度检测） | 中 | 高 | 缺失 | 环境漂移自适配 |
+| 3.4 | 版本 DAG 补 `specialization` / `composition` 边（当前仅 `patch`） | 低 | 中 | [repository.py:143](file:///home/our0boros/Project/ExecutableExperience/experience_os/repository.py#L143) | 分支/组合版本 |
+| 3.5 | 归纳异步化（当前 [runtime.py:213](file:///home/our0boros/Project/ExecutableExperience/experience_os/runtime.py#L213) 同步阻塞） | 低 | 低 | 同步 | 主流程不阻塞 |
+| 3.6 | TerminalBench 适配器（harbor 已 submodule，无 adapter） | 低 | 中 | 缺失 | 跨环境验证 |
+| 3.7 | 多层级知识库（personal/org/public 优先级覆盖） + artifact 包格式 | 低 | 高 | 缺失 | 公共知识库愿景 |
+
+### 里程碑
+
+- **M1（阶段一完成）**：四组 Baseline 在 τ-bench retail 上跑通，产出积累曲线图 → 可写实验段。
+- **M2（阶段二完成）**：归纳算法在真实多步轨迹上稳定触发，replay 验证通过率 ≥ 0.8 → 可写方法段。
+- **M3（阶段三按需）**：架构完善 + 跨环境/跨域迁移实验 → 可写分析段与扩展实验。
+
+### 修正说明
+
+本节 §7 已根据实际代码通读修正 [STRUCTURE.md](file:///home/our0boros/Project/ExecutableExperience/docs/STRUCTURE.md) §3–§4 中偏乐观的描述：
+- §3.6 标注 SQLite"✅ 主存储"实为 **Storage 类已实现但未接入 Repository**（仅 embedding 缓存用），见 §7-3.1。
+- Phase 1 分段在代码中结果被丢弃，§3.3 标注"⚠️ 有但退步"应改为"占位未生效"，见 §7-2.1。
+- StructuredCoT 实际仅填 goal 字段，§3.2 标注"⚠️ 有字段但内容空"已确认，见 §7-2.5。

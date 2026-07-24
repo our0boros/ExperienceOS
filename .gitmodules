@@ -4,3 +4,6 @@
 [submodule "tau2-bench"]
 	path = tau2-bench
 	url = https://gh-proxy.org/https://github.com/sierra-research/tau2-bench.git
+[submodule "SkillOpt"]
+	path = SkillOpt
+	url = https://gh-proxy.org/https://github.com/microsoft/SkillOpt.git
