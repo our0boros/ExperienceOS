@@ -33,6 +33,7 @@ ACCUMULATION 阶段                   DEPLOYMENT 阶段
 |------|------|------|
 | 数据模型 | `models.py` | Trajectory / Harness / Stats / VerificationMeta |
 | 经验仓库 | `repository.py` | 4 层存储（轨迹→记录→Harness→统计）+ 版本 DAG |
+| **层级化经验库** | `experience_library.py` | LTS 持久库 + 实验库：底层完整 trajs / 中层 records / 上层 artifacts（详见 [STRUCTURE.md §5-§6](docs/STRUCTURE.md)） |
 | SQLite 存储 | `storage.py` | 结构化查询 + 向量 BLOB 持久化 + JSON 迁移 |
 | Embedding | `embedding.py` | 本地 Qwen3-Embedding-8B → ollama → hash 三级回退 |
 | 环境信息 | `env_info.py` | OS/Python/硬件/模型/包版本收集 |
@@ -43,7 +44,11 @@ ACCUMULATION 阶段                   DEPLOYMENT 阶段
 | τ-bench 适配 | `tau2_adapter.py` | Tau2Environment + 轨迹转换 + 数据划分 |
 | τ-bench Demo | `tau2_demo.py` | 端到端演示 |
 | Baseline | `baseline_eval.py` | 不经归纳的直接 LLM 评估 |
-| CLI | `cli.py` | ping/demo/status/harnesses/env-info/baseline/tau2-demo |
+| **对照实验** | `experiments/compare.py` | vanilla/react/autoharness/skillopt 四方法统一运行器 |
+| **曲线绘图** | `experiments/curve.py` | 积累曲线 + 成本收敛曲线 |
+| CLI | `cli.py` | ping/demo/status/harnesses/env-info/baseline/tau2-demo/compare/curve/lts |
+
+> **架构与实验设计详见** [docs/STRUCTURE.md](docs/STRUCTURE.md)（§5 存储决策、§6 Baseline 对照设计、§7 修复路线图）。
 
 ## 开发环境
 
@@ -108,6 +113,20 @@ experience-os harnesses
 
 # 环境信息
 experience-os env-info
+
+# 对照实验（四方法统一框架，详见 docs/STRUCTURE.md §6）
+experience-os compare --method react --model ollama/qwen2.5:7b --domain retail --warmup 3 --eval 5 --max-steps 15
+experience-os compare --method vanilla --model ollama/qwen2.5:7b --domain retail --warmup 3 --eval 5
+experience-os compare --method skillopt --model ollama/qwen2.5:7b --skill-path SkillOpt/skillopt/envs/tau2/skills/initial.md
+experience-os compare --method autoharness --model ollama/qwen2.5:7b --variant type_split
+experience-os compare --method autoharness --model deepinfra/MiniMaxAI/MiniMax-M2.7 --variant cross_domain --cross-domain airline --domain retail
+
+# 积累曲线 / 成本收敛曲线
+experience-os curve docs/exp_results/vanilla.json docs/exp_results/react.json --output docs/exp_results/curve.png
+experience-os curve --cost docs/exp_results/vanilla.json docs/exp_results/react.json --output docs/exp_results/cost.png
+
+# 查看 LTS 经验库（持久底座，含完整轨迹）
+experience-os lts
 ```
 
 ### DeepInfra 后端

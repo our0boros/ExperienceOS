@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cmp_parser = sub.add_parser("compare", help="run a baseline comparison experiment on τ-bench")
     cmp_parser.add_argument("--method", required=True,
-                            choices=["vanilla", "react", "autoharness"],
+                            choices=["vanilla", "react", "autoharness", "skillopt"],
                             help="baseline method to run")
     cmp_parser.add_argument("--model", required=True,
                             help="litellm model (e.g. ollama/qwen2.5:7b, deepinfra/...)")
@@ -81,6 +81,9 @@ def main(argv: list[str] | None = None) -> int:
     cmp_parser.add_argument("--cross-domain", default="",
                             help="for cross_domain variant: domain to accumulate on")
     cmp_parser.add_argument("--experiment-id", default="", help="override experiment ID")
+    cmp_parser.add_argument("--skill-path", default="", help="path to skill text file (skillopt method)")
+    cmp_parser.add_argument("--delay", type=float, default=0.0,
+                            help="inter-task delay in seconds (DeepInfra auto=3s)")
     cmp_parser.add_argument("--output", default="", help="output JSON path")
 
     curve_parser = sub.add_parser("curve", help="plot accumulation curve from result JSONs")
@@ -146,6 +149,8 @@ def main(argv: list[str] | None = None) -> int:
             variant=args.variant,
             cross_domain=args.cross_domain,
             experiment_id=args.experiment_id,
+            skill_path=args.skill_path,
+            inter_task_delay=args.delay,
         )
         if args.output:
             save_result(exp, args.output)
@@ -162,16 +167,16 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
     if args.command == "lts":
-        from experience_os.lts import LTSStore
-        store = LTSStore()
+        from experience_os.experience_library import ExperienceLibrary
+        store = ExperienceLibrary.persistent()
         exps = store.experiments()
         if not exps:
-            print("(LTS 为空)")
+            print("(LTS 经验库为空)")
             return 0
-        print(f"{'experiment_id':<40} {'method':<12} {'domain':<10} {'ok/n':<8} {'tokens'}")
-        print("-" * 80)
+        print(f"{'experiment_id':<45} {'method':<12} {'domain':<10} {'ok/n':<8} {'tokens'}")
+        print("-" * 85)
         for e in exps:
-            print(f"{e['experiment_id']:<40} {e['method']:<12} {e['domain']:<10} "
+            print(f"{e['experiment_id']:<45} {e['method']:<12} {e['domain']:<10} "
                   f"{e['successes']}/{e['tasks']:<7} {e['tokens']:,}")
         store.close()
         return 0

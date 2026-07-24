@@ -559,14 +559,23 @@ ORDER BY version;
 
 两种维度可正交组合。`type_split + 预积累` 是主实验；`replay` 给上界；`cross_domain` 测迁移鲁棒性。
 
-### 6.5 LTS 经验库（持久底座）
+### 6.5 层级化经验库
 
-[lts.py](file:///home/our0boros/Project/ExecutableExperience/experience_os/lts.py) 在四层 Repository 之下提供**append-only 原始交互日志**：
+[experience_library.py](file:///home/our0boros/Project/ExecutableExperience/experience_os/experience_library.py) 提供**层级化 SQLite 经验库**，三层结构：
 
-- **只追加**：每次执行（method、domain、task、success、tokens、latency、path、轨迹）都写入 SQLite `lts_log`，永不修改。
-- **跨实验共享**：所有实验写同一 LTS，用 `experiment_id` 隔离。`experience-os lts` 列出全部实验。
-- **与归纳解耦**：LTS 只记录"发生了什么"，不关心是否被归纳利用。上层换任意归纳方案（code/text/AST）都不影响底座。
-- **实验内经验库**：每个实验除写 LTS 外，仍维护自己的 ephemeral Repository（`.experience_os_data/`），实验结束可丢弃，原始数据留在 LTS。
+| 层 | 表 | 内容 | 生命周期 |
+|----|-----|------|---------|
+| 底层 | `trajectories` | **完整轨迹**：任务对象、完整对话（LLM 看到的 prompt 和回复）、tool calls/results、reward、tokens | append-only，永不删除 |
+| 中层 | `records` | 经验记录：前置条件、参数化步骤、不变量 | 版本化（superseded_by 链） |
+| 上层 | `artifacts` | harnesses/skills（可执行代码 / 文本技能） | 版本 DAG（parent_seq + edge_type） |
+
+**多实例**：
+- **LTS 库**（`.experience_os_data/lts_library.db`）— 持久，底层 trajs 永不丢失，上层随版本更新优化总结。所有实验都写入此库。
+- **实验库**（`.experience_os_data/exp_<id>.db`）— 临时，服务于单次实验，可丢弃。原始数据仍在 LTS。
+
+与归纳方案解耦：无论上层用什么归纳算法（code/text/AST），都从底层 trajs 读取素材，互不影响。`serialize_messages()` 保留每条消息的 role/content/tool_calls/tool_results 全文。
+
+CLI：`experience-os lts` 列出所有实验汇总。`experience-os compare` 每次运行自动写入 LTS + 实验库。
 
 ### 6.6 成本收敛接口
 
