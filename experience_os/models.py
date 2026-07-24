@@ -1,0 +1,289 @@
+"""Core data models for ExperienceOS.
+
+These map directly to the formalisation in the research proposal:
+
+    * :class:`Step`         — a single (observation, action) pair in a trajectory.
+    * :class:`Trajectory`  — Layer-0 raw experience log.
+    * :class:`ExperienceRecord` — Layer-1 semantic summary induced from a cluster
+      of trajectories.
+    * :class:`Harness`     — Layer-2 compiled, parameterised executable scaffold.
+    * :class:`TaskTypeStats` — accumulation statistics per task type.
+    * :class:`EnvironmentSnapshot` — env state used for precondition matching.
+
+The :class:`Harness` schema implements the extended Hoare Triple
+``H = <P, steps, I, Q, R>`` from §2.1 of the proposal.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import time
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Optional
+
+
+def _uid(prefix: str = "") -> str:
+    return f"{prefix}{uuid.uuid4().hex[:12]}"
+
+
+# =====================================================================
+# Environment
+# =====================================================================
+@dataclass
+class EnvironmentSnapshot:
+    """A flat key-value view of the execution environment.
+
+    Used for precondition matching.  Examples::
+
+        {"os": "linux", "app": "gmail", "version": "3.2", "has_write_perm": True}
+    """
+
+    attributes: dict[str, Any] = field(default_factory=dict)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.attributes.get(key, default)
+
+    def satisfies(self, key: str, expected: Any) -> bool:
+        actual = self.attributes.get(key)
+        if isinstance(expected, list) and not isinstance(expected, str):
+            return actual in expected
+        return actual == expected
+
+
+# =====================================================================
+# Trajectory (Layer 0)
+# =====================================================================
+@dataclass
+class Step:
+    """A single observation-action pair."""
+
+    observation: str
+    action: str  # serialised action description or tool call
+    action_type: str = "generic"  # read / write / think / generic
+    result: str = ""  # post-action observation or tool output
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class StructuredCoT:
+    """Structured reasoning trace accompanying a trajectory.
+
+    Acts as the *observation window* onto latent task variables (see Discuss §5).
+    """
+
+    goal: str = ""
+    constraints: list[str] = field(default_factory=list)
+    unknown: list[str] = field(default_factory=list)
+    risk: str = ""
+    milestones: list[str] = field(default_factory=list)
+    reflection: str = ""
+
+
+@dataclass
+class Trajectory:
+    """Layer-0 raw experience: a complete agent execution trace."""
+
+    task_id: str
+    task_description: str
+    task_type: str = ""  # semantic cluster label
+    steps: list[Step] = field(default_factory=list)
+    structured_cot: StructuredCoT = field(default_factory=StructuredCoT)
+    env_snapshot: EnvironmentSnapshot = field(default_factory=EnvironmentSnapshot)
+    outcome: str = "success"  # "success" | "failure"
+    tokens_used: int = 0
+    latency_seconds: float = 0.0
+    timestamp: float = field(default_factory=time.time)
+    id: str = field(default_factory=lambda: _uid("traj_"))
+
+    def fingerprint(self) -> str:
+        """A stable hash for dedup / replay comparison."""
+        raw = f"{self.task_type}|{self.task_description}|{len(self.steps)}"
+        for s in self.steps:
+            raw += f"|{s.action}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+# =====================================================================
+# Experience Record (Layer 1)
+# =====================================================================
+@dataclass
+class ParamStep:
+    """A parameterised step in a canonical action sequence."""
+
+    template: str  # e.g. "call_api(endpoint={endpoint}, params={params})"
+    params: list[str] = field(default_factory=list)
+    action_type: str = "generic"
+
+
+@dataclass
+class ExperienceRecord:
+    """Layer-1 semantic summary induced from a cluster of trajectories."""
+
+    task_type: str
+    candidate_preconditions: dict[str, Any] = field(default_factory=dict)
+    param_steps: list[ParamStep] = field(default_factory=list)
+    invariants: list[str] = field(default_factory=list)
+    terminal_verifier: str = ""  # description of success end-state
+    observed_variations: list[str] = field(default_factory=list)
+    source_trajectory_ids: list[str] = field(default_factory=list)
+    support_count: int = 0
+    id: str = field(default_factory=lambda: _uid("rec_"))
+
+
+# =====================================================================
+# Harness / Artifact (Layer 2)
+# =====================================================================
+class FailureType(str, Enum):
+    """Harness execution failure classification (§3.4)."""
+
+    F1_PRECONDITION_GAP = "F1"  # constraint gap
+    F2_IMPLEMENTATION_ERROR = "F2"  # selector/timing bug
+    F3_ENVIRONMENT_DRIFT = "F3"  # UI/API change
+    F4_OUT_OF_SCOPE = "F4"  # task outside harness capability
+
+
+class HarnessStatus(str, Enum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    DEPRECATED = "deprecated"
+
+
+@dataclass
+class VerificationMeta:
+    """Sandbox replay validation metadata."""
+
+    method: str = "sandbox_replay"
+    success_rate: float = 0.0
+    test_count: int = 0
+    last_validated: float = field(default_factory=time.time)
+
+
+@dataclass
+class Harness:
+    """A compiled executable scaffold (the ``Artifact``).
+
+    Implements ``H = <P, steps, I, Q, R>``:
+        P = preconditions, steps = procedure, I = invariants,
+        Q = postconditions/terminal_verifier, R = rollback.
+    """
+
+    # identity
+    id: str = field(default_factory=lambda: _uid("harn_"))
+    name: str = ""
+    version: int = 1
+    parent_id: Optional[str] = None  # version DAG link
+    status: HarnessStatus = HarnessStatus.ACTIVE
+
+    # semantic
+    task_type: str = ""
+    description: str = ""  # natural-language description for retrieval
+    capability: str = ""  # e.g. "document_validation"
+
+    # Hoare triple components
+    preconditions: dict[str, Any] = field(default_factory=dict)
+    soft_preconditions: dict[str, Any] = field(default_factory=dict)
+    procedure_code: str = ""  # the actual executable Python code
+    invariants: list[str] = field(default_factory=list)
+    terminal_verifier: str = ""
+    rollback: str = ""
+
+    # parameters
+    params: list[str] = field(default_factory=list)
+
+    # provenance & validation
+    source_record_ids: list[str] = field(default_factory=list)
+    verification: VerificationMeta = field(default_factory=VerificationMeta)
+    failure_counts: dict[str, int] = field(default_factory=dict)
+    embedding: Optional[list[float]] = None  # cached retrieval vector
+
+    # timestamps
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+    # ------------------------------------------------------------------
+    @property
+    def full_name(self) -> str:
+        return f"{self.name}-v{self.version}" if self.name else self.id
+
+    def retrieval_text(self) -> str:
+        """The text used to compute the harness embedding vector."""
+        return (
+            f"task_type: {self.task_type}\n"
+            f"capability: {self.capability}\n"
+            f"description: {self.description}\n"
+            f"preconditions: {self.preconditions}\n"
+        )
+
+    def mdl(self, alpha: float = 1.0, beta: float = 0.5, gamma: float = 0.3) -> float:
+        """Minimum Description Length prior score (§2.2).
+
+        Lower = simpler.  Used in the Bayesian induction criterion.
+        """
+        n_steps = self.procedure_code.count("\n") + 1 if self.procedure_code else 0
+        n_params = len(self.params)
+        n_invariants = len(self.invariants)
+        return alpha * n_steps + beta * n_params + gamma * n_invariants
+
+
+# =====================================================================
+# Task-type statistics (Layer 3 / Meta-experience)
+# =====================================================================
+@dataclass
+class TaskTypeStats:
+    """Accumulation statistics for one task type (§4 of Discuss)."""
+
+    task_type: str = ""
+
+    # counts
+    total_executions: int = 0
+    harness_executions: int = 0
+    agent_executions: int = 0
+
+    # quality
+    harness_successes: int = 0
+    agent_successes: int = 0
+
+    # failures
+    failure_counts: dict[str, int] = field(default_factory=dict)
+
+    # env coverage
+    observed_envs: list[str] = field(default_factory=list)
+
+    # induction state
+    current_harness_id: Optional[str] = None
+    last_induction_time: Optional[float] = None
+
+    # estimated token savings
+    estimated_token_savings: int = 0
+
+    @property
+    def harness_success_rate(self) -> float:
+        return self.harness_successes / self.harness_executions if self.harness_executions else 0.0
+
+    @property
+    def agent_success_rate(self) -> float:
+        return self.agent_successes / self.agent_executions if self.agent_executions else 0.0
+
+    @property
+    def support_count(self) -> int:
+        """Trajectories accumulated for this task type."""
+        return self.agent_executions  # during accumulation, agent path
+
+
+# =====================================================================
+# Execution result
+# =====================================================================
+@dataclass
+class ExecutionResult:
+    """Outcome of running a harness or agent on a task."""
+
+    success: bool
+    path: str  # "harness" | "harness_with_fallback" | "agent_fallback"
+    harness_id: Optional[str] = None
+    tokens_used: int = 0
+    latency_seconds: float = 0.0
+    failure_type: Optional[str] = None
+    trajectory: Optional[Trajectory] = None
+    output: str = ""

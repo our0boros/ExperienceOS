@@ -1,0 +1,46 @@
+{
+  "model": "deepinfra/MiniMaxAI/MiniMax-M2.7",
+  "domain": "retail",
+  "total_tasks": 3,
+  "successes": 0,
+  "success_rate": 0.0,
+  "avg_reward": 0.0,
+  "total_tokens": 4248,
+  "avg_latency": 75.65,
+  "task_types": {
+    "find_user_id_by_name_zip": {
+      "count": 3,
+      "success_rate": 0.0,
+      "avg_reward": 0.0
+    }
+  },
+  "results": [
+    {
+      "task_id": "0",
+      "task_type": "find_user_id_by_name_zip",
+      "reward": 0.0,
+      "tokens": 2555,
+      "latency": 80.32,
+      "success": false,
+      "error": ""
+    },
+    {
+      "task_id": "1",
+      "task_type": "find_user_id_by_name_zip",
+      "reward": 0.0,
+      "tokens": 1693,
+      "latency": 94.31,
+      "success": false,
+      "error": ""
+    },
+    {
+      "task_id": "2",
+      "task_type": "find_user_id_by_name_zip",
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 52.33,
+      "success": false,
+      "error": "litellm.InternalServerError: InternalServerError: OpenAIException - Missing credentials. Please pass an `api_key`, `workload_identity`, `admin_api_key`, or set the `OPENAI_API_KEY` or `OPENAI_ADMIN_KE"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+[submodule "harbor-TerminalBench"]
+	path = harbor-TerminalBench
+	url = https://gh-proxy.org/https://github.com/our0boros/harbor.git
+[submodule "tau2-bench"]
+	path = tau2-bench
+	url = https://gh-proxy.org/https://github.com/sierra-research/tau2-bench.git
