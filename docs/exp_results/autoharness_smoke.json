@@ -1,0 +1,84 @@
+{
+  "method": "autoharness",
+  "model": "ollama/qwen2.5:7b",
+  "domain": "retail",
+  "task_type": "find_user_id_by_email",
+  "warmup_size": 3,
+  "eval_size": 2,
+  "max_steps": 10,
+  "results": [
+    {
+      "idx": 1,
+      "phase": "warmup",
+      "task_id": "10",
+      "task_type": "find_user_id_by_email",
+      "method": "autoharness",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 2.3970699310302734,
+      "path": "agent",
+      "error": ""
+    },
+    {
+      "idx": 2,
+      "phase": "warmup",
+      "task_id": "11",
+      "task_type": "find_user_id_by_email",
+      "method": "autoharness",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 2.3521995544433594,
+      "path": "agent",
+      "error": ""
+    },
+    {
+      "idx": 3,
+      "phase": "warmup",
+      "task_id": "12",
+      "task_type": "find_user_id_by_email",
+      "method": "autoharness",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 2.614548444747925,
+      "path": "agent",
+      "error": ""
+    },
+    {
+      "idx": 4,
+      "phase": "eval",
+      "task_id": "13",
+      "task_type": "find_user_id_by_email",
+      "method": "autoharness",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 2.5927395820617676,
+      "path": "agent",
+      "error": ""
+    },
+    {
+      "idx": 5,
+      "phase": "eval",
+      "task_id": "14",
+      "task_type": "find_user_id_by_email",
+      "method": "autoharness",
+      "success": false,
+      "reward": 0.0,
+      "tokens": 0,
+      "latency": 2.705841064453125,
+      "path": "agent",
+      "error": ""
+    }
+  ],
+  "summary": {
+    "total": 5,
+    "successes": 0,
+    "success_rate": 0.0,
+    "total_tokens": 0,
+    "avg_latency": 2.53,
+    "eval_success_rate": 0.0
+  }
+}

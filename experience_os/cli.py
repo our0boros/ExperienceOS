@@ -61,6 +61,28 @@ def main(argv: list[str] | None = None) -> int:
     bl_parser.add_argument("--api-key", default="", help="custom API key")
     bl_parser.add_argument("--output", default="", help="output JSON file path")
 
+    cmp_parser = sub.add_parser("compare", help="run a baseline comparison experiment on τ-bench")
+    cmp_parser.add_argument("--method", required=True,
+                            choices=["vanilla", "react", "autoharness"],
+                            help="baseline method to run")
+    cmp_parser.add_argument("--model", required=True,
+                            help="litellm model (e.g. ollama/qwen2.5:7b, deepinfra/...)")
+    cmp_parser.add_argument("--domain", default="retail")
+    cmp_parser.add_argument("--warmup", type=int, default=3)
+    cmp_parser.add_argument("--eval", type=int, default=5)
+    cmp_parser.add_argument("--max-steps", type=int, default=15)
+    cmp_parser.add_argument("--task-type", default="")
+    cmp_parser.add_argument("--solo", action="store_true")
+    cmp_parser.add_argument("--no-validation", action="store_true", help="ablation: skip harness validation")
+    cmp_parser.add_argument("--no-versioning", action="store_true", help="ablation: disable versioning")
+    cmp_parser.add_argument("--output", default="", help="output JSON path")
+
+    curve_parser = sub.add_parser("curve", help="plot accumulation curve from result JSONs")
+    curve_parser.add_argument("inputs", nargs="+", help="result JSON files")
+    curve_parser.add_argument("--output", default="docs/exp_results/curve.png")
+    curve_parser.add_argument("--warmup-split", type=int, default=0)
+    curve_parser.add_argument("--window", type=int, default=3)
+
     tau2_parser = sub.add_parser("tau2-demo", help="run τ-bench integration demo")
     tau2_parser.add_argument("--domain", default="retail", help="τ-bench domain")
     tau2_parser.add_argument("--warmup", type=int, default=3, help="warm-up pool size")
@@ -96,6 +118,32 @@ def main(argv: list[str] | None = None) -> int:
             llm_api_base=args.llm_api_base,
             task_type=args.task_type,
             solo_mode=args.solo,
+        )
+        return 0
+    if args.command == "compare":
+        from experience_os.experiments.compare import run_experiment, save_result
+
+        exp = run_experiment(
+            method=args.method,
+            model=args.model,
+            domain=args.domain,
+            warmup=args.warmup,
+            eval_size=args.eval,
+            max_steps=args.max_steps,
+            task_type=args.task_type,
+            solo_mode=args.solo,
+            skip_validation=args.no_validation,
+            no_versioning=args.no_versioning,
+        )
+        if args.output:
+            save_result(exp, args.output)
+        return 0
+    if args.command == "curve":
+        from experience_os.experiments.curve import plot_curve
+
+        plot_curve(
+            args.inputs, output=args.output,
+            warmup_split=args.warmup_split or None, window=args.window,
         )
         return 0
     if args.command == "env-info":
