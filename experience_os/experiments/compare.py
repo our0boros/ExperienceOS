@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -46,11 +45,13 @@ class TaskResult:
     method: str
     success: bool
     reward: float
-    tokens: int
+    tokens: int                # 总 token = prompt + completion
     latency: float
     path: str
     error: str = ""
     messages_json: str = ""  # 完整对话（prompt + 回复）
+    prompt_tokens: int = 0     # 输入 token 数（从 API response 获取）
+    completion_tokens: int = 0 # 输出 token 数
 
 
 @dataclass
@@ -99,6 +100,8 @@ class ExperimentResult:
             "successes": self.successes,
             "success_rate": round(self.success_rate, 4),
             "total_tokens": self.total_tokens,
+            "total_prompt_tokens": sum(r.prompt_tokens for r in self.results),
+            "total_completion_tokens": sum(r.completion_tokens for r in self.results),
             "avg_latency": round(self.avg_latency, 2),
             "eval_success_rate": round(
                 sum(1 for r in self.eval_results() if r.success)
@@ -135,6 +138,44 @@ def _resolve_tau2_model(model: str) -> tuple[str, str]:
 
 def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
+
+
+def _extract_token_usage(messages_json: str) -> tuple[int, int, int]:
+    """从序列化的 messages JSON 中提取 token 用量。
+
+    返回 (prompt_tokens, completion_tokens, total_tokens)。
+    τ-bench 的 Message.usage 字段记录了每一步的 API 实际用量。
+    如果 usage 不可用（如 fallback LLM），则从文本估算。
+    """
+    if not messages_json or len(messages_json) < 20:
+        return 0, 0, 0
+    try:
+        msgs = json.loads(messages_json)
+    except json.JSONDecodeError:
+        total = _estimate_tokens(messages_json)
+        return 0, 0, total
+
+    prompt = 0
+    completion = 0
+    for msg in msgs:
+        usage = msg.get("usage") if isinstance(msg, dict) else {}
+        if usage:
+            prompt += usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
+            completion += usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
+        else:
+            # 每轮对话的文本估算
+            content = str(msg.get("content", "")) if isinstance(msg, dict) else ""
+            role = msg.get("role", "") if isinstance(msg, dict) else ""
+            est = max(1, len(content) // 4)
+            if role in ("assistant", "tool"):
+                completion += est
+            else:
+                prompt += est
+
+    total = prompt + completion
+    if total == 0:
+        total = _estimate_tokens(messages_json)
+    return prompt, completion, total or max(1, prompt + completion)
 
 
 def _is_deepinfra(model: str) -> bool:
@@ -204,7 +245,11 @@ def run_vanilla(task, domain, model, max_steps, solo_mode) -> TaskResult:
         )
         messages_log.append({"role": "assistant", "content": json.dumps(data, ensure_ascii=False)})
         calls = data.get("calls", []) if isinstance(data, dict) else []
-        tokens = _estimate_tokens(json.dumps(data, ensure_ascii=False))
+        prompt_text = json.dumps(data, ensure_ascii=False)
+        tokens = _estimate_tokens(prompt_text)
+        # 估算 input/output 分开
+        prompt_tok = _estimate_tokens(desc + schema_txt) + 200  # system + user prompt
+        completion_tok = tokens
         for c in calls[:max_steps]:
             name = c.get("name", "")
             args = c.get("arguments", {}) or c.get("args", {})
@@ -213,12 +258,14 @@ def run_vanilla(task, domain, model, max_steps, solo_mode) -> TaskResult:
                 messages_log.append({"role": "tool", "name": name,
                                      "result": str(result)[:500]})
         reward = 1.0 if env.verify("", "") else 0.0
+        messages_json = json.dumps(messages_log, ensure_ascii=False)
         return TaskResult(
             idx=0, phase="eval", task_id=task.id, task_type=task_type,
             method="vanilla", success=reward >= 1.0, reward=reward,
-            tokens=tokens, latency=time.time() - t0, path="agent",
+            tokens=tokens, prompt_tokens=prompt_tok, completion_tokens=completion_tok,
+            latency=time.time() - t0, path="agent",
             error="" if reward >= 1.0 else "no_match",
-            messages_json=json.dumps(messages_log, ensure_ascii=False),
+            messages_json=messages_json,
         )
     except Exception as exc:
         return TaskResult(
@@ -247,11 +294,12 @@ def run_react(task, domain, model, max_steps, solo_mode, seed=42) -> TaskResult:
         reward = sim.reward_info.reward if sim.reward_info else 0.0
         msgs = sim.get_messages() if hasattr(sim, "get_messages") else (sim.messages or [])
         messages_json = serialize_messages(msgs)
-        tokens = int(getattr(sim, "agent_cost", 0) or 0) or _estimate_tokens(messages_json)
+        pt, ct, tt = _extract_token_usage(messages_json)
         return TaskResult(
             idx=0, phase="eval", task_id=task.id, task_type=task_type,
             method="react", success=reward >= 1.0, reward=reward,
-            tokens=tokens, latency=time.time() - t0, path="agent",
+            tokens=tt, prompt_tokens=pt, completion_tokens=ct,
+            latency=time.time() - t0, path="agent",
             messages_json=messages_json,
         )
     except Exception as exc:
@@ -295,11 +343,12 @@ def run_skillopt(task, domain, model, max_steps, solo_mode, skill_text, seed=42)
         reward = sim.reward_info.reward if sim.reward_info else 0.0
         msgs = sim.get_messages() if hasattr(sim, "get_messages") else (sim.messages or [])
         messages_json = serialize_messages(msgs)
-        tokens = int(getattr(sim, "agent_cost", 0) or 0) or _estimate_tokens(messages_json)
+        pt, ct, tt = _extract_token_usage(messages_json)
         return TaskResult(
             idx=0, phase="eval", task_id=task.id, task_type=task_type,
             method="skillopt", success=reward >= 1.0, reward=reward,
-            tokens=tokens, latency=time.time() - t0, path="agent",
+            tokens=tt, prompt_tokens=pt, completion_tokens=ct,
+            latency=time.time() - t0, path="agent",
             messages_json=messages_json,
         )
     except Exception as exc:
@@ -341,8 +390,8 @@ def run_autoharness(group, domain, model, warmup, eval_size, max_steps, solo_mod
     )
 
     cfg = Config()
-    if cfg.data_dir.exists():
-        shutil.rmtree(cfg.data_dir)
+    # 不清理 data_dir——LTS 数据库是永久底座，追加不删除。
+    # Runtime 的 Repository 创建 JSON 文件时会自动覆盖旧的。
     cfg.ensure_dirs()
     if skip_validation:
         cfg.induction.validation_threshold = 0.0
@@ -368,8 +417,9 @@ def run_autoharness(group, domain, model, warmup, eval_size, max_steps, solo_mod
             traj = convert_simulation(sim, task, tt)
             rt.repo.add_trajectory(traj)
             reward = sim.reward_info.reward if sim.reward_info else 0.0
-            tokens = int(getattr(sim, "agent_cost", 0) or 0) or max(1, len(traj.steps) * 100)
             msgs = sim.get_messages() if hasattr(sim, "get_messages") else (sim.messages or [])
+            messages_json = serialize_messages(msgs)
+            pt, ct, tt_tok = _extract_token_usage(messages_json)
             stats = rt.repo.get_stats(tt)
             stats.total_executions += 1
             stats.agent_executions += 1
@@ -379,8 +429,9 @@ def run_autoharness(group, domain, model, warmup, eval_size, max_steps, solo_mod
             results.append(TaskResult(
                 idx=idx, phase="warmup", task_id=task.id, task_type=tt,
                 method="autoharness", success=reward >= 1.0, reward=reward,
-                tokens=tokens, latency=time.time() - t0, path="agent",
-                messages_json=serialize_messages(msgs),
+                tokens=tt_tok, prompt_tokens=pt, completion_tokens=ct,
+                latency=time.time() - t0, path="agent",
+                messages_json=messages_json,
             ))
         except Exception as exc:
             results.append(TaskResult(
@@ -451,14 +502,16 @@ def run_autoharness(group, domain, model, warmup, eval_size, max_steps, solo_mod
             traj = convert_simulation(sim, task, tt)
             rt.repo.add_trajectory(traj)
             reward = sim.reward_info.reward if sim.reward_info else 0.0
-            tokens = int(getattr(sim, "agent_cost", 0) or 0) or max(1, len(traj.steps) * 100)
             msgs = sim.get_messages() if hasattr(sim, "get_messages") else (sim.messages or [])
+            messages_json = serialize_messages(msgs)
+            pt, ct, tt_tok = _extract_token_usage(messages_json)
             path = "harness+agent" if used_harness else "agent"
             results.append(TaskResult(
                 idx=idx, phase="eval", task_id=task.id, task_type=tt,
                 method="autoharness", success=reward >= 1.0, reward=reward,
-                tokens=tokens, latency=time.time() - t0, path=path,
-                messages_json=serialize_messages(msgs),
+                tokens=tt_tok, prompt_tokens=pt, completion_tokens=ct,
+                latency=time.time() - t0, path=path,
+                messages_json=messages_json,
             ))
         except Exception as exc:
             results.append(TaskResult(
@@ -614,7 +667,11 @@ def _to_trajectory_record(r: TaskResult, eid: str, domain: str, task: Any,
         idx=r.idx, phase=r.phase, success=r.success, reward=r.reward,
         tokens=r.tokens, latency=r.latency, path=r.path,
         task_json=task_json, messages_json=r.messages_json,
-        meta={"model": model, "variant": variant, "error": r.error},
+        meta={
+            "model": model, "variant": variant, "error": r.error,
+            "prompt_tokens": r.prompt_tokens,
+            "completion_tokens": r.completion_tokens,
+        },
     )
 
 
@@ -625,7 +682,9 @@ def _print_summary(exp: ExperimentResult) -> None:
     print(f"{'='*60}")
     print(f"  总任务:   {exp.total}")
     print(f"  成功率:   {exp.successes}/{exp.total} ({exp.success_rate:.1%})")
-    print(f"  总 Token: {exp.total_tokens:,}")
+    total_pt = sum(r.prompt_tokens for r in exp.results)
+    total_ct = sum(r.completion_tokens for r in exp.results)
+    print(f"  总 Token: {exp.total_tokens:,} (prompt={total_pt:,} + completion={total_ct:,})")
     print(f"  平均延迟: {exp.avg_latency:.1f}s")
     ev = exp.eval_results()
     if ev:

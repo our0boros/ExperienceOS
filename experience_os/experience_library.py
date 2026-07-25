@@ -148,7 +148,8 @@ class TrajectoryRecord:
 def serialize_messages(messages: list[Any]) -> str:
     """将 tau2 消息对象序列化为完整 JSON（保留 prompt 和回复全文）。
 
-    每条消息记录 role / content / tool_calls / tool_results。
+    每条消息记录 role / content / tool_calls / tool_results / usage。
+    usage 字段包含 API 返回的实际 prompt_tokens 和 completion_tokens。
     """
     out = []
     for msg in messages:
@@ -169,6 +170,10 @@ def serialize_messages(messages: list[Any]) -> str:
             entry["tool_results"] = [str(tm.content)[:2000] for tm in tool_msgs]
         elif getattr(msg, "tool_call_id", None):
             entry["tool_call_id"] = str(msg.tool_call_id)
+        # API token usage (preserved for accurate cost tracking)
+        usage = getattr(msg, "usage", None)
+        if usage:
+            entry["usage"] = dict(usage) if not isinstance(usage, dict) else usage
         out.append(entry)
     return json.dumps(out, ensure_ascii=False, default=str)
 

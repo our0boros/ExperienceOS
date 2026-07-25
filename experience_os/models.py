@@ -64,6 +64,7 @@ class Step:
     action_type: str = "generic"  # read / write / think / generic
     result: str = ""  # post-action observation or tool output
     metadata: dict[str, Any] = field(default_factory=dict)
+    sub_step_intent: str = ""  # intent label from sub-step decomposition (§3.5 sub-step tracking)
 
 
 @dataclass
@@ -96,6 +97,7 @@ class Trajectory:
     latency_seconds: float = 0.0
     timestamp: float = field(default_factory=time.time)
     id: str = field(default_factory=lambda: _uid("traj_"))
+    sub_step_plan: list[SubStepPlan] = field(default_factory=list)  # Phase 0 decomposition
 
     def fingerprint(self) -> str:
         """A stable hash for dedup / replay comparison."""
@@ -103,6 +105,75 @@ class Trajectory:
         for s in self.steps:
             raw += f"|{s.action}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+# =====================================================================
+# Sub-step tracking (§3.5 sub-step pattern discovery)
+# =====================================================================
+@dataclass
+class SubStepPlan:
+    """A planned sub-step within a larger task.
+
+    Produced by Phase 0 (sub-step decomposition) before execution.
+    Each sub-step records its intent/goal and the expected action type,
+    enabling cross-trajectory pattern matching independent of full-task success.
+    """
+
+    intent: str          # e.g. "find_user_id_by_email"
+    goal: str            # what this sub-step aims to achieve
+    context: str = ""    # preconditions / environment context at this step
+    expected_action: str = ""  # the action expected (e.g. tool name)
+    action_type: str = "generic"
+
+
+@dataclass
+class SubStepPattern:
+    """A recurring sub-step pattern discovered across multiple trajectories.
+
+    When the same intent (+ similar context) appears in >= MIN_SUPPORT
+    trajectories, the pattern is a candidate for artifact induction.
+    """
+
+    intent: str                      # semantic label (e.g. "user_lookup_by_email")
+    action_name: str                 # canonical action name (e.g. "find_user_id_by_email")
+    action_type: str = "generic"     # read / write / think / generic
+    support_count: int = 0           # number of times this pattern was observed
+    success_count: int = 0           # number of successful executions
+    example_contexts: list[str] = field(default_factory=list)  # context samples for LLM judgment
+    example_params: list[dict] = field(default_factory=list)   # parameter variations
+    artifact_value_score: float = 0.0  # 0-1, set by ArtifactJudge
+    artifact_type: str = ""            # "harness" | "skill" | "verifier" | "" (not yet judged)
+    skip_reason: str = ""              # if judged not worth compiling, why
+    id: str = field(default_factory=lambda: _uid("ssp_"))
+
+    @property
+    def success_rate(self) -> float:
+        return self.success_count / self.support_count if self.support_count else 0.0
+
+
+class ArtifactType(str, Enum):
+    """The kind of artifact a sub-step pattern should be compiled into."""
+
+    HARNESS = "harness"     # executable Python code (deterministic, bypasses LLM)
+    SKILL = "skill"         # text skill document (guides LLM, doesn't bypass)
+    VERIFIER = "verifier"   # post-condition checker (run after agent execution)
+    SKIP = "skip"           # not worth compiling
+
+
+@dataclass
+class SubStepOutcome:
+    """The result of executing one sub-step within a task.
+
+    Accumulated per task execution and used to update SubStepPattern stats.
+    """
+
+    intent: str
+    action_name: str
+    action_type: str = "generic"
+    context: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
+    success: bool = False
+    error: str = ""
 
 
 # =====================================================================

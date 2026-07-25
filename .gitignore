@@ -39,3 +39,6 @@ Thumbs.db
 .env
 .env.local
 *.secret
+
+/artifacts/
+/docs/exp_results/

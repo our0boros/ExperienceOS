@@ -23,8 +23,16 @@ from experience_os.agent import AgentFallback, classify_failure
 from experience_os.compiler import HarnessInductor
 from experience_os.config import Config
 from experience_os.environment import BaseEnvironment, TaskRequest
+from experience_os.harness_registry import HarnessRegistry
 from experience_os.llm import LLMClient
-from experience_os.models import ExecutionResult, FailureType, Harness, Trajectory
+from experience_os.models import (
+    ExecutionResult,
+    FailureType,
+    Harness,
+    Step,
+    SubStepOutcome,
+    Trajectory,
+)
 from experience_os.repository import Repository
 from experience_os.retriever import RuntimeRouter
 
@@ -62,6 +70,7 @@ class Runtime:
         self.router = RuntimeRouter(self.repo, self.llm)
         self.agent = AgentFallback(self.llm)
         self.inductor = HarnessInductor(self.config, self.llm, self.repo)
+        self.registry = HarnessRegistry(self.repo)
         self.mode: SystemMode = SystemMode.ACCUMULATION
 
     # ==================================================================
@@ -149,12 +158,77 @@ class Runtime:
         return result
 
     # ==================================================================
-    # internal: agent execution
+    # internal: agent execution (with harness interception)
     # ==================================================================
     def _agent_only(self, request: TaskRequest) -> ExecutionResult:
+        # Load available harnesses for sub-step interception
+        if self.registry.count == 0:
+            self.registry.load_all()
+
+        # Wrap env.call_tool with harness registry lookup
+        original_call = self.env.call_tool
+
+        def _harness_aware_call(name: str, arguments: dict, **kwargs) -> str:
+            if not arguments and kwargs:
+                arguments = kwargs
+            # Check registry for this tool intent
+            harness = self.registry.lookup(name)
+            if harness:
+                # Build a minimal task request for the harness
+                h_request = TaskRequest(
+                    task_id=f"{request.task_id}_{name}",
+                    task_description=f"Execute {name}",
+                    task_type=name,
+                    params=arguments,
+                    expected_output="",
+                )
+                h_result = self.env.execute_harness(harness, h_request)
+                if h_result.success:
+                    self.registry.record_call(name, True)
+                    log.info("Harness %s → %s (success)", harness.full_name, name)
+                    return h_result.output or "ok"
+                else:
+                    log.warning("Harness %s failed for %s, falling back to LLM",
+                                harness.full_name, name)
+                    self.registry.record_call(name, False)
+
+            # Fallthrough: direct environment tool call
+            return original_call(name, arguments)
+
+        # Monkey-patch env.call_tool for this agent run
+        self.env.call_tool = _harness_aware_call
+
         result = self.agent.run(request, self.env, task_type=request.task_type)
         log.info("Agent executed: success=%s tokens=%d", result.success, result.tokens_used)
+
+        # Restore original call_tool
+        self.env.call_tool = original_call
         return result
+
+    # ==================================================================
+    # internal: sub-step extraction (§3.5 sub-step pattern discovery)
+    # ==================================================================
+    def _extract_substeps(self, trajectory: Trajectory) -> list[SubStepOutcome]:
+        """Extract sub-step outcomes from a completed trajectory.
+
+        Each step becomes a :class:`SubStepOutcome` grouped by action name.
+        These are later aggregated by :meth:`HarnessInductor._discover_substep_patterns`.
+        """
+        outcomes: list[SubStepOutcome] = []
+        for step in trajectory.steps:
+            action_name = step.action.split("(")[0].strip()
+            intent = step.sub_step_intent or action_name
+            outcome = SubStepOutcome(
+                intent=intent,
+                action_name=action_name,
+                action_type=step.action_type,
+                context=step.observation[:200],
+                params=step.metadata.get("params", {}),
+                success=bool(step.result) and "Error" not in step.result,
+                error=step.result[:100] if "Error" in step.result else "",
+            )
+            outcomes.append(outcome)
+        return outcomes
 
     # ==================================================================
     # internal: experience accumulation (§3.5)
@@ -173,6 +247,9 @@ class Runtime:
                 latency_seconds=result.latency_seconds,
             )
         self.repo.add_trajectory(result.trajectory)
+
+        # extract sub-step outcomes for pattern discovery
+        substep_outcomes = self._extract_substeps(result.trajectory)
 
         # update task-type stats
         stats = self.repo.get_stats(request.task_type)
@@ -205,12 +282,32 @@ class Runtime:
             )
         self.repo.save_stats(request.task_type)
 
-        # async-ish: check induction trigger for this task type
+        # async-ish: check induction triggers
         if self.mode == SystemMode.ACCUMULATION:
+            # 1. Full-task level trigger
             trigger = self.inductor.check_triggers(request.task_type)
             if trigger == "new_harness":
                 log.info("Auto-inducing harness for '%s' (new_harness trigger)", request.task_type)
-                self.inductor.induce(request.task_type, self.env)
+                self.inductor.induce(request.task_type, self.env, trigger="new_harness")
+
+            # 2. Sub-step pattern level trigger
+            #    Discover patterns across all trajectories; fire ArtifactJudge
+            #    for any pattern that meets MIN_SUPPORT.
+            all_trajs = list(self.repo._trajectories.values())
+            patterns = self.inductor._discover_substep_patterns(all_trajs)
+            for key, pattern in patterns.items():
+                if pattern.support_count >= self.config.induction.min_support:
+                    # Run ArtifactJudge to determine if this pattern is worth compiling
+                    verdict = self.inductor._judge_artifact_value(pattern)
+                    if verdict in ("harness", "skill", "verifier"):
+                        log.info("Auto-inducing sub-step artifact for '%s' (%s, confidence=%.2f)",
+                                 pattern.intent, verdict.value, pattern.artifact_value_score)
+                        self.inductor.induce(
+                            request.task_type, self.env,
+                            trigger="substep_pattern",
+                            substep_pattern=pattern,
+                        )
+                    break  # one induction per accumulation cycle
 
     # ==================================================================
     # diagnostics
