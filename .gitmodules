@@ -6,4 +6,4 @@
 	url = https://gh-proxy.org/https://github.com/sierra-research/tau2-bench.git
 [submodule "SkillOpt"]
 	path = SkillOpt
-	url = https://gh-proxy.org/https://github.com/microsoft/SkillOpt.git
+	url = https://github.com/our0boros/ExperienceOS.git
