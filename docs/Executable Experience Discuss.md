@@ -1,3 +1,16 @@
+> ⚠️ **历史讨论文档（不作为实施依据）**
+>
+> 本文档是 ExperienceOS 项目早期方向推演的多轮讨论记录，保留作为历史参考。
+> - 本文档中出现的项目名称（AutoHarness / ExperienceOS / EOS / Experience Compiler / Experience Runtime / Persistent Cognitive Runtime / Executable Experience Repository）**已全部统一为 ExperienceOS**。
+> - 本文档中的核心数据结构（Experience Object `E=(C,S,A,V,P)` / Artifact yaml schema）**已废弃**，统一采用扩展 Hoare Triple `⟨P, steps, I, Q, R⟩`。
+> - 本文档中的经验层次（三层/四层并存）**已统一**为 Layer 0–3 四层经验表示层次 + SubStep/Task/Composite 归纳层次。
+> - 本文档中 F2 触发阈值（2 次 vs 3 次）**已统一**为 `F2 ≥ 2`。
+>
+> **当本文档与 `ExperienceOS.md`（基准文档）冲突时，一律以 `ExperienceOS.md` 为准。**
+> 本文档仅供理解设计思路演化过程，不作为工程实施或论文撰写的依据。
+
+---
+
 我看完会议记录和 demo 文档后，我觉得之前我们讨论的方向需要**重新校准一下**。会议里的核心其实不是“做一个新的 POMDP/world model”，也不是单纯做 memory，而是在寻找一个更具体的 **Agent 自我改进机制**。
 
 先给结论：
