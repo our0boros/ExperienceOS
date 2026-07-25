@@ -1,9 +1,9 @@
 [submodule "harbor-TerminalBench"]
 	path = harbor-TerminalBench
-	url = https://gh-proxy.org/https://github.com/our0boros/harbor.git
+	url = https://github.com/our0boros/harbor.git
 [submodule "tau2-bench"]
 	path = tau2-bench
-	url = https://gh-proxy.org/https://github.com/sierra-research/tau2-bench.git
+	url = https://github.com/sierra-research/tau2-bench.git
 [submodule "SkillOpt"]
 	path = SkillOpt
-	url = https://github.com/our0boros/ExperienceOS.git
+	url = https://github.com/our0boros/SkillOpt.git
