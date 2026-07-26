@@ -6,7 +6,7 @@
 方法：
     * ``vanilla``      — 单轮 LLM：任务+工具 schema，一次产出全部工具调用。
     * ``react``        — τ-bench 内置多步 ReAct agent，无积累。
-    * ``autoharness``  — Warm-up 积累 → 归纳 → Eval 部署（Harness 优先）。
+    * ``coe``          — Compilation of Experience: Warm-up 积累 → 归纳 → Eval 部署（Harness 优先）。
     * ``skillopt``     — 读取训练好的 skill 文本注入 agent system prompt。
 
 所有轨迹（完整对话/prompt/回复）写入 **LTS 经验库**（持久底座）+
@@ -114,9 +114,34 @@ class ExperimentResult:
 # ======================================================================
 # 任务加载与划分
 # ======================================================================
-def load_tasks(domain: str = "retail") -> list:
+def load_tasks(domain: str = "retail", split: str = "base") -> list:
+    """加载 tau2 任务。
+
+    Args:
+        split: "base" (全部) | "train" | "test"
+               tau2 retail 内置 train(74)/test(40)/base 划分。
+    """
     mod = __import__(f"tau2.domains.{domain}.environment", fromlist=["get_tasks"])
-    return mod.get_tasks("base")
+    return mod.get_tasks(split)
+
+
+def load_train_test_split(domain: str = "retail") -> tuple[list, list]:
+    """加载 tau2 原生 train/test 划分。
+
+    返回 (train_tasks, test_tasks)。
+    如果该域不支持 split，则回退到 base 全量 + 按 task_type 分组划分。
+    """
+    try:
+        mod = __import__(f"tau2.domains.{domain}.environment", fromlist=["get_tasks"])
+        train = mod.get_tasks("train")
+        test = mod.get_tasks("test")
+        if train and test:
+            return train, test
+    except Exception as exc:
+        log.warning("域 %s 不支持 train/test split: %s，回退到 base", domain, exc)
+    # 回退：用 base 全量，前 N 条做 warmup
+    all_tasks = load_tasks(domain, "base")
+    return all_tasks, all_tasks
 
 
 def pick_task_group(tasks: list, task_type: str = "", warmup: int = 3):
@@ -199,72 +224,32 @@ def _serialize_task(task: Any) -> str:
 # ======================================================================
 # 方法：vanilla（单轮 LLM）
 # ======================================================================
-def run_vanilla(task, domain, model, max_steps, solo_mode) -> TaskResult:
-    from experience_os.llm import LLMClient
-    from experience_os.config import Config
-    from experience_os.tau2_adapter import (
-        Tau2Environment, _extract_task_description, extract_task_params,
-    )
+def run_vanilla(task, domain, model, max_steps, solo_mode, seed=42) -> TaskResult:
+    """Vanilla baseline：用 τ-bench 标准 simulation 跑 LLM agent（无额外 skill）。
 
-    cfg = Config()
-    if model.startswith("ollama/"):
-        cfg.llm.backend = "ollama"
-        cfg.llm.ollama_model = model.split("/", 1)[-1]
-    elif model.startswith("deepinfra/"):
-        cfg.llm.backend = "deepinfra"
-        cfg.llm.deepinfra_model = model.split("/", 1)[-1]
-    client = LLMClient(cfg.llm)
+    与 run_react 使用相同的 τ-bench orchestrator/simulation 框架，
+    区别是 vanilla 不做任何 prompt 增强。
+    """
+    from experience_os.tau2_adapter import run_tau2_simulation
 
     t0 = time.time()
     task_type = infer_task_type(task)
-    desc = _extract_task_description(task)
-    messages_log = []  # 完整 prompt + 回复
+    tau2_model, api_base = _resolve_tau2_model(model)
     try:
-        env = Tau2Environment(domain, task, solo_mode=solo_mode)
-        tools = env.get_tools()
-        schema_lines = []
-        for t in tools:
-            fn = t["function"] if isinstance(t, dict) and "function" in t else t
-            name = fn.get("name", "")
-            params = fn.get("parameters", {}).get("properties", {})
-            pstr = ", ".join(f'{k}:{v.get("type","str")}' for k, v in params.items())
-            schema_lines.append(f"  - {name}({pstr})")
-        schema_txt = "\n".join(schema_lines[:20])
-
-        prompt = (
-            "You are a customer-service agent. Emit a JSON object "
-            '{"calls": [{"name": str, "arguments": dict}, ...]} with ordered '
-            "tool calls. No other text.\n\n"
-            f"Available tools:\n{schema_txt}\n\nTask: {desc}\n"
+        sim = run_tau2_simulation(
+            domain=domain, task=task, llm_model=tau2_model,
+            llm_api_base=api_base, max_steps=max_steps,
+            seed=seed, solo_mode=solo_mode,
         )
-        messages_log.append({"role": "user", "content": prompt})
-        data = client.chat_json(
-            [{"role": "system", "content": "You output only JSON tool-call plans."},
-             {"role": "user", "content": prompt}],
-            temperature=0.0,
-        )
-        messages_log.append({"role": "assistant", "content": json.dumps(data, ensure_ascii=False)})
-        calls = data.get("calls", []) if isinstance(data, dict) else []
-        prompt_text = json.dumps(data, ensure_ascii=False)
-        tokens = _estimate_tokens(prompt_text)
-        # 估算 input/output 分开
-        prompt_tok = _estimate_tokens(desc + schema_txt) + 200  # system + user prompt
-        completion_tok = tokens
-        for c in calls[:max_steps]:
-            name = c.get("name", "")
-            args = c.get("arguments", {}) or c.get("args", {})
-            if name:
-                result = env.call_tool(name, args)
-                messages_log.append({"role": "tool", "name": name,
-                                     "result": str(result)[:500]})
-        reward = 1.0 if env.verify("", "") else 0.0
-        messages_json = json.dumps(messages_log, ensure_ascii=False)
+        reward = sim.reward_info.reward if sim.reward_info else 0.0
+        msgs = sim.get_messages() if hasattr(sim, "get_messages") else (sim.messages or [])
+        messages_json = serialize_messages(msgs)
+        pt, ct, tt = _extract_token_usage(messages_json)
         return TaskResult(
             idx=0, phase="eval", task_id=task.id, task_type=task_type,
             method="vanilla", success=reward >= 1.0, reward=reward,
-            tokens=tokens, prompt_tokens=prompt_tok, completion_tokens=completion_tok,
+            tokens=tt, prompt_tokens=pt, completion_tokens=ct,
             latency=time.time() - t0, path="agent",
-            error="" if reward >= 1.0 else "no_match",
             messages_json=messages_json,
         )
     except Exception as exc:
@@ -272,7 +257,6 @@ def run_vanilla(task, domain, model, max_steps, solo_mode) -> TaskResult:
             idx=0, phase="eval", task_id=task.id, task_type=task_type,
             method="vanilla", success=False, reward=0.0, tokens=0,
             latency=time.time() - t0, path="agent", error=str(exc)[:200],
-            messages_json=json.dumps(messages_log, ensure_ascii=False),
         )
 
 
@@ -377,10 +361,12 @@ def _inject_skill(agent, skill_content: str) -> None:
 
 
 # ======================================================================
-# 方法：autoharness
+# 方法：coe (Compilation of Experience)
 # ======================================================================
-def run_autoharness(group, domain, model, warmup, eval_size, max_steps, solo_mode,
-                    *, skip_validation=False, no_versioning=False) -> list[TaskResult]:
+def run_coe(group, domain, model, warmup, eval_size, max_steps, solo_mode,
+                    *, skip_validation=False, no_versioning=False,
+                    warmup_tasks=None, eval_tasks=None,
+                    experiment_id: str = "") -> list[TaskResult]:
     from experience_os.config import Config
     from experience_os.environment import MockEnvironment
     from experience_os.runtime import Runtime, SystemMode
@@ -392,6 +378,13 @@ def run_autoharness(group, domain, model, warmup, eval_size, max_steps, solo_mod
     cfg = Config()
     # 不清理 data_dir——LTS 数据库是永久底座，追加不删除。
     # Runtime 的 Repository 创建 JSON 文件时会自动覆盖旧的。
+    # 配置归纳用 LLM 后端（与实验模型一致）
+    if model.startswith("deepinfra/"):
+        cfg.llm.backend = "deepinfra"
+        cfg.llm.deepinfra_model = model.split("/", 1)[-1]
+    elif model.startswith("ollama/"):
+        cfg.llm.backend = "ollama"
+        cfg.llm.ollama_model = model.split("/", 1)[-1]
     cfg.ensure_dirs()
     if skip_validation:
         cfg.induction.validation_threshold = 0.0
@@ -399,12 +392,14 @@ def run_autoharness(group, domain, model, warmup, eval_size, max_steps, solo_mod
     tau2_model, api_base = _resolve_tau2_model(model)
     sequential = _is_deepinfra(model)
 
-    warmup_tasks = group[:warmup]
-    eval_tasks = group[warmup: warmup + eval_size]
+    warmup_tasks = warmup_tasks if warmup_tasks is not None else group[:warmup]
+    eval_tasks = eval_tasks if eval_tasks is not None else group[warmup: warmup + eval_size]
     results: list[TaskResult] = []
+    warmup_results: list[TaskResult] = []  # 收集用于子步骤提取
     idx = 1
 
     rt.set_mode(SystemMode.ACCUMULATION)
+    rt.set_phase("warmup")
     for i, task in enumerate(warmup_tasks, 1):
         tt = infer_task_type(task)
         t0 = time.time()
@@ -426,42 +421,127 @@ def run_autoharness(group, domain, model, warmup, eval_size, max_steps, solo_mod
             if reward >= 1.0:
                 stats.agent_successes += 1
             rt.repo.save_stats(tt)
-            results.append(TaskResult(
+            wr = TaskResult(
                 idx=idx, phase="warmup", task_id=task.id, task_type=tt,
-                method="autoharness", success=reward >= 1.0, reward=reward,
+                method="coe", success=reward >= 1.0, reward=reward,
                 tokens=tt_tok, prompt_tokens=pt, completion_tokens=ct,
                 latency=time.time() - t0, path="agent",
                 messages_json=messages_json,
-            ))
+            )
+            results.append(wr)
+            warmup_results.append(wr)
         except Exception as exc:
-            results.append(TaskResult(
+            wr = TaskResult(
                 idx=idx, phase="warmup", task_id=task.id, task_type=tt,
-                method="autoharness", success=False, reward=0.0, tokens=0,
+                method="coe", success=False, reward=0.0, tokens=0,
                 latency=time.time() - t0, path="agent", error=str(exc)[:200],
-            ))
+            )
+            results.append(wr)
+            warmup_results.append(wr)
         idx += 1
+
+        # ── 在线检测：每个成功任务后，提取 tool calls 写入 substeps → 检查触发 ──
+        if reward >= 1.0 and messages_json:
+            try:
+                _log_tool_calls_as_substeps(wr, experiment_id)
+            except Exception:
+                pass
+
         if sequential and i < len(warmup_tasks):
             time.sleep(3)
 
-    # 归纳
+    # 归纳（双级：全任务 + 子步骤模式） — 批量补充（可能已被在线检测覆盖）
     induced = []
+    warmup_map = {t.id: t for t in warmup_tasks}
+
+    def _env_builder(traj):
+        t = warmup_map.get(traj.task_id)
+        if t is not None:
+            return Tau2Environment(domain, t, solo_mode=solo_mode)
+        return Tau2Environment(domain, warmup_tasks[0], solo_mode=solo_mode)
+
+    # 从 warmup 轨迹的 messages_json 中直接提取 tool calls 写入 substeps 表
+    print(f"  [substep] extracting from {len(warmup_results)} warmup results...")
+    try:
+        from experience_os.experience_library import ExperienceLibrary, SubStepRecord
+        import json as _json
+        lts_lib = ExperienceLibrary.persistent()
+        n_sub = 0
+        for r in warmup_results:
+            if not r.messages_json:
+                continue
+            try:
+                msgs = _json.loads(r.messages_json) if isinstance(r.messages_json, str) else r.messages_json
+            except Exception:
+                continue
+            if not isinstance(msgs, list):
+                continue
+            plan_idx = 0
+            for msg in msgs:
+                tool_calls = msg.get("tool_calls", []) if isinstance(msg, dict) else []
+                if not isinstance(tool_calls, list):
+                    continue
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    # 兼容两种格式：OpenAI ({function: {name, arguments}}) 和扁平 ({name, arguments})
+                    fn = tc.get("function", tc)
+                    tool_name = fn.get("name", "")
+                    args = fn.get("arguments", "{}")
+                    if isinstance(args, str):
+                        try: args = _json.loads(args)
+                        except Exception: args = {"raw": args}
+                    intent = tool_name  # TODO: LLM infer better intent later
+                    rec = SubStepRecord(
+                        trajectory_id=r.task_id,
+                        experiment_id=experiment_id or "unknown",
+                        plan_idx=plan_idx,
+                        intent=intent,
+                        tool_name=tool_name,
+                        params_json=_json.dumps(args, ensure_ascii=False),
+                        success=True,  # tool call was made; actual success TBD by result
+                        execution_mode="agent",
+                        source="react",
+                        parent_task_type=r.task_type,
+                        parent_task_success=r.success,
+                    )
+                    lts_lib.log_substep(rec)
+                    plan_idx += 1
+                    n_sub += 1
+        if n_sub:
+            print(f"  [substep] extracted {n_sub} tool calls as substeps")
+            log.info("Extracted %d substeps from warmup messages", n_sub)
+    except Exception as exc:
+        log.warning("Substep extraction skipped: %s", exc)
+
+    # 全任务级 + 子步骤级归纳
+    # 限定子步骤发现范围到当前实验（避免跨实验污染旧轨迹）
+    rt.inductor._current_experiment_id = experiment_id
     for tt in rt.repo.all_task_types():
-        trigger = rt.inductor.check_triggers(tt)
-        if not trigger:
+        triggers = rt.inductor.check_triggers(tt)  # 新签名：返回 list[(trigger, pattern)]
+        if not triggers:
             continue
         same = [t for t in warmup_tasks if infer_task_type(t) == tt]
         if not same:
             continue
-        try:
-            venv = Tau2Environment(domain, same[0])
-            h = rt.inductor.induce(tt, venv)
-            if h:
-                induced.append(h)
-        except Exception as exc:
-            log.warning("induce %s failed: %s", tt, exc)
+        for trigger, pattern in triggers:
+            try:
+                venv = Tau2Environment(domain, same[0], solo_mode=solo_mode)
+                if pattern is not None:
+                    h = rt.inductor.induce(
+                        tt, venv, trigger,
+                        substep_pattern=pattern, env_builder=_env_builder,
+                    )
+                else:
+                    h = rt.inductor.induce(tt, venv, trigger, env_builder=_env_builder)
+                if h:
+                    induced.append(h)
+            except Exception as exc:
+                log.warning("induce %s failed: %s", tt, exc)
 
     # eval: harness 优先
     rt.set_mode(SystemMode.DEPLOYMENT)
+    rt.set_phase("eval")
     for i, task in enumerate(eval_tasks, 1):
         tt = infer_task_type(task)
         desc = _extract_task_description(task)
@@ -482,7 +562,7 @@ def run_autoharness(group, domain, model, warmup, eval_size, max_steps, solo_mod
                 if r.success:
                     results.append(TaskResult(
                         idx=idx, phase="eval", task_id=task.id, task_type=tt,
-                        method="autoharness", success=True, reward=1.0,
+                        method="coe", success=True, reward=1.0,
                         tokens=r.tokens_used, latency=time.time() - t0,
                         path="harness",
                     ))
@@ -508,7 +588,7 @@ def run_autoharness(group, domain, model, warmup, eval_size, max_steps, solo_mod
             path = "harness+agent" if used_harness else "agent"
             results.append(TaskResult(
                 idx=idx, phase="eval", task_id=task.id, task_type=tt,
-                method="autoharness", success=reward >= 1.0, reward=reward,
+                method="coe", success=reward >= 1.0, reward=reward,
                 tokens=tt_tok, prompt_tokens=pt, completion_tokens=ct,
                 latency=time.time() - t0, path=path,
                 messages_json=messages_json,
@@ -516,9 +596,18 @@ def run_autoharness(group, domain, model, warmup, eval_size, max_steps, solo_mod
         except Exception as exc:
             results.append(TaskResult(
                 idx=idx, phase="eval", task_id=task.id, task_type=tt,
-                method="autoharness", success=False, reward=0.0, tokens=0,
+                method="coe", success=False, reward=0.0, tokens=0,
                 latency=time.time() - t0, path=path, error=str(exc)[:200],
             ))
+
+        # P2.2 eval 在线反馈：agent/harness+agent 路径的轨迹也提取子步骤
+        _last = results[-1]
+        if _last.path != "harness" and _last.messages_json and _last.success:
+            try:
+                _log_tool_calls_as_substeps(_last, experiment_id)
+            except Exception:
+                pass
+
         idx += 1
         if sequential and i < len(eval_tasks):
             time.sleep(3)
@@ -550,11 +639,17 @@ def run_experiment(
     """运行单方法对照实验。
 
     Args:
-        method: ``vanilla`` | ``react`` | ``autoharness`` | ``skillopt``
+        method: ``vanilla`` | ``react`` | ``coe`` | ``skillopt``
         model: litellm 模型名
-        variant: ``type_split`` | ``replay`` | ``cross_domain``
+        variant: ``type_split`` | ``replay`` | ``cross_domain`` | ``train_test``
         skill_path: skillopt 方法的 skill 文本路径
         inter_task_delay: 任务间间隔秒数（DeepInfra 自动设 3s）
+
+    variant 说明:
+        - ``type_split``: 按 task_type 分组，同组前 N 做 warmup，后续做 eval
+        - ``replay``: warmup 和 eval 用相同任务（回放验证）
+        - ``cross_domain``: 跨域积累（cross_domain 做 warmup，本域做 eval）
+        - ``train_test``: 使用 tau2 原生 train/test split（retail: train=74, test=40）
     """
     # DeepInfra 自动顺序
     if _is_deepinfra(model) and inter_task_delay == 0.0:
@@ -568,23 +663,37 @@ def run_experiment(
           + (f"  skill={skill_path}" if skill_path else ""))
     print(f"{'='*60}\n")
 
-    tasks = load_tasks(domain)
-    group, chosen_type = pick_task_group(tasks, task_type, warmup)
-    print(f"  任务类型: {chosen_type} ({len(group)} 个)")
-
     # 实验设计变体
-    if variant == "replay":
-        warmup_tasks = group[:warmup]
-        eval_tasks = group[:eval_size]
-    elif variant == "cross_domain" and cross_domain:
-        cd_tasks = load_tasks(cross_domain)
-        cd_group, _ = pick_task_group(cd_tasks, task_type, warmup)
-        warmup_tasks = cd_group[:warmup]
-        eval_tasks = group[:eval_size]
-        print(f"  跨域积累: {cross_domain} → 验证: {domain}")
+    if variant == "train_test":
+        # 使用 tau2 原生 train/test split
+        train_tasks, test_tasks = load_train_test_split(domain)
+        print(f"  tau2 split: train={len(train_tasks)} test={len(test_tasks)}")
+        if task_type:
+            from experience_os.tau2_adapter import infer_task_type
+            train_tasks = [t for t in train_tasks if infer_task_type(t) == task_type]
+            test_tasks = [t for t in test_tasks if infer_task_type(t) == task_type]
+            print(f"  筛选 task_type={task_type}: train={len(train_tasks)} test={len(test_tasks)}")
+        warmup_tasks = train_tasks[:warmup]
+        eval_tasks = test_tasks[:eval_size]
+        chosen_type = task_type or "all"
+        group = train_tasks  # coe 用 train 全量做积累
     else:
-        warmup_tasks = group[:warmup]
-        eval_tasks = group[warmup: warmup + eval_size]
+        tasks = load_tasks(domain)
+        group, chosen_type = pick_task_group(tasks, task_type, warmup)
+        print(f"  任务类型: {chosen_type} ({len(group)} 个)")
+
+        if variant == "replay":
+            warmup_tasks = group[:warmup]
+            eval_tasks = group[:eval_size]
+        elif variant == "cross_domain" and cross_domain:
+            cd_tasks = load_tasks(cross_domain)
+            cd_group, _ = pick_task_group(cd_tasks, task_type, warmup)
+            warmup_tasks = cd_group[:warmup]
+            eval_tasks = group[:eval_size]
+            print(f"  跨域积累: {cross_domain} → 验证: {domain}")
+        else:
+            warmup_tasks = group[:warmup]
+            eval_tasks = group[warmup: warmup + eval_size]
 
     stream = warmup_tasks + eval_tasks
 
@@ -605,10 +714,12 @@ def run_experiment(
 
     results: list[TaskResult] = []
 
-    if method == "autoharness":
-        results = run_autoharness(
+    if method == "coe":
+        results = run_coe(
             group, domain, model, warmup, eval_size, max_steps, solo_mode,
             skip_validation=skip_validation, no_versioning=no_versioning,
+            warmup_tasks=warmup_tasks, eval_tasks=eval_tasks,
+            experiment_id=eid,
         )
     else:
         for i, task in enumerate(stream, 1):
@@ -627,14 +738,14 @@ def run_experiment(
             rec = _to_trajectory_record(r, eid, domain, task, model, variant)
             lts.log_trajectory(rec)
             exp_lib.log_trajectory(rec)
-            tag = "✓" if r.success else "✗"
+            tag = "[OK]" if r.success else "[X]"
             print(f"  [{i}/{len(stream)}] {phase} {r.task_id} {tag} "
                   f"reward={r.reward:.2f} tokens={r.tokens} {r.error[:40]}")
             if inter_task_delay and i < len(stream):
                 time.sleep(inter_task_delay)
 
-    # autoharness 也写入 LTS + 实验库
-    if method == "autoharness":
+    # coe 也写入 LTS + 实验库
+    if method == "coe":
         warmup_n = len(warmup_tasks)
         for r in results:
             task = (warmup_tasks + eval_tasks)[r.idx - 1] if r.idx <= len(stream) else None
@@ -645,7 +756,7 @@ def run_experiment(
     exp = ExperimentResult(
         method=method, model=model, domain=domain, task_type=chosen_type,
         warmup_size=warmup, eval_size=eval_size, max_steps=max_steps,
-        results=results, experiment_id=eid,
+        results=results, experiment_id=experiment_id or "unknown",
     )
     _print_summary(exp)
     print(f"  experiment_id: {eid}")
@@ -654,6 +765,61 @@ def run_experiment(
     lts.close()
     exp_lib.close()
     return exp
+
+
+def _log_tool_calls_as_substeps(r: TaskResult, experiment_id: str) -> int:
+    """从 TaskResult 的 messages_json 中提取 tool calls，写入 substeps 表。"""
+    import json as _json
+    from experience_os.experience_library import ExperienceLibrary, SubStepRecord
+
+    if not r.messages_json:
+        return 0
+    try:
+        msgs = _json.loads(r.messages_json) if isinstance(r.messages_json, str) else r.messages_json
+    except Exception:
+        return 0
+    if not isinstance(msgs, list):
+        return 0
+
+    lts = ExperienceLibrary.persistent()
+    n = 0
+    plan_idx = 0
+    for msg in msgs:
+        if not isinstance(msg, dict):
+            continue
+        tcs = msg.get("tool_calls", [])
+        if not isinstance(tcs, list):
+            continue
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function", tc)
+            tool_name = fn.get("name", "")
+            if not tool_name:
+                continue
+            args = fn.get("arguments", "{}")
+            if isinstance(args, str):
+                try:
+                    args = _json.loads(args)
+                except Exception:
+                    args = {"raw": args}
+            rec = SubStepRecord(
+                trajectory_id=r.task_id,
+                experiment_id=experiment_id,
+                plan_idx=plan_idx,
+                intent=tool_name,
+                tool_name=tool_name,
+                params_json=_json.dumps(args, ensure_ascii=False),
+                success=True,
+                execution_mode="agent",
+                source="react",
+                parent_task_type=r.task_type,
+                parent_task_success=r.success,
+            )
+            lts.log_substep(rec)
+            plan_idx += 1
+            n += 1
+    return n
 
 
 def _to_trajectory_record(r: TaskResult, eid: str, domain: str, task: Any,
@@ -686,10 +852,18 @@ def _print_summary(exp: ExperimentResult) -> None:
     total_ct = sum(r.completion_tokens for r in exp.results)
     print(f"  总 Token: {exp.total_tokens:,} (prompt={total_pt:,} + completion={total_ct:,})")
     print(f"  平均延迟: {exp.avg_latency:.1f}s")
-    ev = exp.eval_results()
-    if ev:
-        esr = sum(1 for r in ev if r.success) / len(ev)
-        print(f"  Eval SR:  {esr:.1%} ({len(ev)} tasks)")
+
+    # 阶段化统计（warmup vs eval）
+    warmup = [r for r in exp.results if r.phase == "warmup"]
+    eval_r = [r for r in exp.results if r.phase == "eval"]
+    if warmup:
+        w_sr = sum(1 for r in warmup if r.success) / len(warmup)
+        w_tok = sum(r.tokens for r in warmup)
+        print(f"  [Warmup] SR: {w_sr:.1%} ({len(warmup)} tasks)  Token: {w_tok:,}")
+    if eval_r:
+        e_sr = sum(1 for r in eval_r if r.success) / len(eval_r)
+        e_tok = sum(r.tokens for r in eval_r)
+        print(f"  [Eval]   SR: {e_sr:.1%} ({len(eval_r)} tasks)  Token: {e_tok:,}")
     paths = Counter(r.path for r in exp.results)
     print(f"  路径分布: {dict(paths)}")
     print(f"{'='*60}\n")

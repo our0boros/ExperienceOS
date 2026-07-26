@@ -72,6 +72,7 @@ class Runtime:
         self.inductor = HarnessInductor(self.config, self.llm, self.repo)
         self.registry = HarnessRegistry(self.repo)
         self.mode: SystemMode = SystemMode.ACCUMULATION
+        self.phase: str = ""  # "warmup" | "eval" | "" — 由实验框架设置
 
     # ==================================================================
     # public API
@@ -79,6 +80,10 @@ class Runtime:
     def set_mode(self, mode: SystemMode) -> None:
         log.info("Switching to %s mode", mode.value)
         self.mode = mode
+
+    def set_phase(self, phase: str) -> None:
+        """设置当前实验阶段（warmup / eval），标记到轨迹记录。"""
+        self.phase = phase
 
     def execute(self, request: TaskRequest) -> ExecutionResult:
         """Execute a single task request.
@@ -246,6 +251,7 @@ class Runtime:
                 tokens_used=result.tokens_used,
                 latency_seconds=result.latency_seconds,
             )
+        result.trajectory.phase = self.phase  # 标记实验阶段
         self.repo.add_trajectory(result.trajectory)
 
         # extract sub-step outcomes for pattern discovery

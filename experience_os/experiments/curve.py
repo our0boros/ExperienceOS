@@ -3,7 +3,7 @@
 读取多个 ``save_result`` 产出的 JSON，绘制：
     * x = 任务序号（覆盖 warmup+eval）
     * y = 滚动成功率（窗口=3）
-    * 竖线标注 warmup/eval 分界（autoharness 在 K 处"交叉超越"）
+    * 竖线标注 warmup/eval 分界（coe 在 K 处"交叉超越"）
 
 依赖：matplotlib（可选）。无 matplotlib 时输出 CSV + ASCII 火花线。
 """
@@ -107,7 +107,7 @@ def plot_cost_curve(
 ) -> str:
     """绘制成本收敛曲线：累计 token + 滚动平均 token。
 
-    用于回答"经验积累是否让成本收敛"——autoharness 在 harness 命中后
+    用于回答"经验积累是否让成本收敛"——coe 在 harness 命中后
     token 应骤降，rolling_avg 收敛到低位。
     """
     series = []

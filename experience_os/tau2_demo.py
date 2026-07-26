@@ -75,7 +75,7 @@ def run_tau2_demo(
     print("=" * 64)
 
     if not check_tau2():
-        print("\n✗ tau2 未安装。请先执行：")
+        print("\n[X] tau2 未安装。请先执行：")
         print("  cd /home/our0boros/Project/ExecutableExperience")
         print("  source .venv/bin/activate && uv pip install -e ./tau2-bench")
         return
@@ -156,9 +156,9 @@ def run_tau2_demo(
     rt = Runtime(config, env)
 
     if not rt.llm.ping():
-        print("✗ EOS LLM 不可达")
+        print("[X] EOS LLM 不可达")
         return
-    print("✓ EOS LLM 可达")
+    print("[OK] EOS LLM 可达")
 
     # ================================================================
     # 3. ACCUMULATION：跑 tau2 仿真，记录轨迹
@@ -211,7 +211,7 @@ def run_tau2_demo(
                   f"tokens≈{tokens} latency={elapsed:.1f}s")
         except Exception as exc:
             elapsed = time.time() - t0
-            print(f"      ✗ 仿真失败 ({elapsed:.1f}s): {exc}")
+            print(f"      [X] 仿真失败 ({elapsed:.1f}s): {exc}")
             # 记录失败轨迹
             traj = Trajectory(
                 task_id=task.id,
@@ -246,19 +246,19 @@ def run_tau2_demo(
                     validate_env = Tau2Environment(domain, same_type_tasks[0])
                     harness = rt.inductor.induce(task_type, validate_env)
                     if harness:
-                        print(f"  ✓ {harness.full_name} APPROVED "
+                        print(f"  [OK] {harness.full_name} APPROVED "
                               f"(replay sr={harness.verification.success_rate:.2f})")
                         induced.append(harness)
                     else:
-                        print(f"  ✗ 归纳失败或被拒绝")
+                        print(f"  [X] 归纳失败或被拒绝")
                 else:
                     # 用 MockEnvironment 验证（退化）
                     harness = rt.inductor.induce(task_type, env)
                     if harness:
-                        print(f"  ✓ {harness.full_name} APPROVED (mock validation)")
+                        print(f"  [OK] {harness.full_name} APPROVED (mock validation)")
                         induced.append(harness)
             except Exception as exc:
-                print(f"  ✗ 归纳异常: {exc}")
+                print(f"  [X] 归纳异常: {exc}")
                 import traceback
 
                 traceback.print_exc()
@@ -312,15 +312,15 @@ def run_tau2_demo(
                     if result.success:
                         deploy_successes += 1
                         harness_hits += 1
-                        print(f"      ✓ Harness 成功 tokens={result.tokens_used} "
+                        print(f"      [OK] Harness 成功 tokens={result.tokens_used} "
                               f"latency={elapsed:.1f}s")
                         continue
                     else:
-                        print(f"      ✗ Harness 失败 (F{result.failure_type or '?'}) "
+                        print(f"      [X] Harness 失败 (F{result.failure_type or '?'}) "
                               f"→ fallback to agent")
                         used_harness = True
                 except Exception as exc:
-                    print(f"      ✗ Harness 异常: {exc} → fallback to agent")
+                    print(f"      [X] Harness 异常: {exc} → fallback to agent")
 
         # Agent fallback: 跑 tau2 仿真
         try:
@@ -344,12 +344,12 @@ def run_tau2_demo(
                 deploy_successes += 1
 
             path = "harness+agent" if used_harness else "agent"
-            print(f"      {'✓' if reward >= 1.0 else '✗'} Agent "
+            print(f"      {'[OK]' if reward >= 1.0 else '[X]'} Agent "
                   f"reward={reward:.2f} tokens≈{tokens} "
                   f"path={path} latency={elapsed:.1f}s")
         except Exception as exc:
             elapsed = time.time() - t0
-            print(f"      ✗ Agent 仿真失败 ({elapsed:.1f}s): {exc}")
+            print(f"      [X] Agent 仿真失败 ({elapsed:.1f}s): {exc}")
 
     # ================================================================
     # 6. 汇总

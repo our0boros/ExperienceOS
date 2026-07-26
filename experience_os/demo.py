@@ -61,10 +61,10 @@ def run_demo(config: Config) -> None:
     # ---- ping ----
     print("\n[0] Pinging LLM backend...")
     if not rt.llm.ping():
-        print("✗ LLM unreachable. Check EOS_LLM_BACKEND / ollama running.")
+        print("[X] LLM unreachable. Check EOS_LLM_BACKEND / ollama running.")
         print("  (try: ollama serve)")
         return
-    print("✓ LLM reachable")
+    print("[OK] LLM reachable")
 
     # ---- ACCUMULATION ----
     print("\n[1] ACCUMULATION phase — executing tasks via agent fallback")
@@ -82,7 +82,7 @@ def run_demo(config: Config) -> None:
         result = rt.execute(req)
         elapsed = time.time() - t0
         accum_results.append(result)
-        status = "✓" if result.success else "✗"
+        status = "[OK]" if result.success else "[X]"
         print(f"  {status} task {i}: success={result.success} "
               f"path={result.path} tokens={result.tokens_used} "
               f"latency={elapsed:.1f}s")
@@ -92,15 +92,15 @@ def run_demo(config: Config) -> None:
     harnesses = rt.repo.active_harnesses()
     if harnesses:
         for h in harnesses:
-            print(f"  ✓ {h.full_name} (replay sr={h.verification.success_rate:.2f}, "
+            print(f"  [OK] {h.full_name} (replay sr={h.verification.success_rate:.2f}, "
                   f"code={len(h.procedure_code)} chars)")
     else:
         print("  (no harnesses yet — checking triggers manually...")
         h = rt.maybe_induce()
         if h:
-            print(f"  ✓ Induced {h.full_name}")
+            print(f"  [OK] Induced {h.full_name}")
         else:
-            print("  ✗ Induction did not fire (may need more support)")
+            print("  [X] Induction did not fire (may need more support)")
 
     # ---- DEPLOYMENT ----
     print("\n[3] DEPLOYMENT phase — should now use harness (zero tokens)")
@@ -118,7 +118,7 @@ def run_demo(config: Config) -> None:
         result = rt.execute(req)
         elapsed = time.time() - t0
         deploy_results.append(result)
-        status = "✓" if result.success else "✗"
+        status = "[OK]" if result.success else "[X]"
         print(f"  {status} task {i}: success={result.success} "
               f"path={result.path} tokens={result.tokens_used} "
               f"latency={elapsed:.1f}s")

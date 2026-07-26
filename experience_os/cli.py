@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cmp_parser = sub.add_parser("compare", help="run a baseline comparison experiment on τ-bench")
     cmp_parser.add_argument("--method", required=True,
-                            choices=["vanilla", "react", "autoharness", "skillopt"],
+                            choices=["vanilla", "react", "coe", "skillopt"],
                             help="baseline method to run")
     cmp_parser.add_argument("--model", required=True,
                             help="litellm model (e.g. ollama/qwen2.5:7b, deepinfra/...)")
@@ -75,8 +75,10 @@ def main(argv: list[str] | None = None) -> int:
     cmp_parser.add_argument("--solo", action="store_true")
     cmp_parser.add_argument("--no-validation", action="store_true", help="ablation: skip harness validation")
     cmp_parser.add_argument("--no-versioning", action="store_true", help="ablation: disable versioning")
+    cmp_parser.add_argument("--decompose", action="store_true",
+                            help="use Plan-then-Execute decomposition in coe eval phase")
     cmp_parser.add_argument("--variant", default="type_split",
-                            choices=["type_split", "replay", "cross_domain"],
+                            choices=["type_split", "replay", "cross_domain", "train_test"],
                             help="experiment design variant")
     cmp_parser.add_argument("--cross-domain", default="",
                             help="for cross_domain variant: domain to accumulate on")
@@ -219,15 +221,15 @@ def _cmd_ping(config: Config) -> int:
     print(f"Model:   {config.llm.model}")
     print(f"Base URL: {config.llm.base_url}")
     if client.ping():
-        print("✓ LLM backend reachable")
+        print("[OK] LLM backend reachable")
         # also test embeddings
         try:
             vec = client.embed("hello")
-            print(f"✓ Embeddings OK (dim={len(vec)})")
+            print(f"[OK] Embeddings OK (dim={len(vec)})")
         except Exception as exc:
-            print(f"✗ Embeddings failed: {exc}")
+            print(f"[X] Embeddings failed: {exc}")
         return 0
-    print("✗ LLM backend unreachable")
+    print("[X] LLM backend unreachable")
     return 1
 
 

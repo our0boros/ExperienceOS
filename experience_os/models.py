@@ -98,6 +98,7 @@ class Trajectory:
     timestamp: float = field(default_factory=time.time)
     id: str = field(default_factory=lambda: _uid("traj_"))
     sub_step_plan: list[SubStepPlan] = field(default_factory=list)  # Phase 0 decomposition
+    phase: str = ""  # "warmup" | "eval" | "" — 实验阶段标记
 
     def fingerprint(self) -> str:
         """A stable hash for dedup / replay comparison."""
@@ -137,14 +138,24 @@ class SubStepPattern:
     intent: str                      # semantic label (e.g. "user_lookup_by_email")
     action_name: str                 # canonical action name (e.g. "find_user_id_by_email")
     action_type: str = "generic"     # read / write / think / generic
-    support_count: int = 0           # number of times this pattern was observed
-    success_count: int = 0           # number of successful executions
+    description: str = ""            # human-readable description for retrieval
+    support_count: int = 0           # number of distinct trajectories this pattern appeared in
+    success_count: int = 0           # number of successful single-step executions
+    # 贝叶斯权重字段（从 substeps 表聚合得出）
+    success_in_full_tasks: int = 0   # 此子步骤在成功全任务中的出现次数
+    total_appearances: int = 0       # 此子步骤在任何全任务中的出现次数
+    bayesian_score: float = 0.0      # Beta-Binomial 可信度 (α=1,β=1)
     example_contexts: list[str] = field(default_factory=list)  # context samples for LLM judgment
     example_params: list[dict] = field(default_factory=list)   # parameter variations
     artifact_value_score: float = 0.0  # 0-1, set by ArtifactJudge
     artifact_type: str = ""            # "harness" | "skill" | "verifier" | "" (not yet judged)
     skip_reason: str = ""              # if judged not worth compiling, why
     id: str = field(default_factory=lambda: _uid("ssp_"))
+    # 三要素检索签名
+    input_schema: str = ""           # JSON: {"requires":[...],"from":"..."}
+    output_schema: str = ""          # JSON: {"produces":[...],"type":"..."}
+    effect: str = ""                 # "read_only" | "write" | "mixed"
+    intent_embedding: Optional[list[float]] = None  # cached retrieval vector
 
     @property
     def success_rate(self) -> float:
@@ -200,6 +211,8 @@ class ExperienceRecord:
     observed_variations: list[str] = field(default_factory=list)
     source_trajectory_ids: list[str] = field(default_factory=list)
     support_count: int = 0
+    # 从源轨迹提取的示例任务描述，供 compiler.py 在归纳时填充到 Harness.example_tasks
+    example_task_descriptions: list[str] = field(default_factory=list)
     id: str = field(default_factory=lambda: _uid("rec_"))
 
 
@@ -251,6 +264,13 @@ class Harness:
     task_type: str = ""
     description: str = ""  # natural-language description for retrieval
     capability: str = ""  # e.g. "document_validation"
+    # 示例任务描述（用于检索增强，§5.5.1 检索向量维度）
+    example_tasks: list[str] = field(default_factory=list)
+
+    # version DAG 边类型（§P1-4）："patch" | "specialization" | "composition" | ""
+    edge_type: str = ""
+    split_reason: str = ""  # 特化分裂原因（如 "variation: 3_steps_alt"）
+    merge_source_ids: list[str] = field(default_factory=list)  # composition 合并来源
 
     # Hoare triple components
     preconditions: dict[str, Any] = field(default_factory=dict)
@@ -280,12 +300,16 @@ class Harness:
 
     def retrieval_text(self) -> str:
         """The text used to compute the harness embedding vector."""
-        return (
-            f"task_type: {self.task_type}\n"
-            f"capability: {self.capability}\n"
-            f"description: {self.description}\n"
-            f"preconditions: {self.preconditions}\n"
-        )
+        parts = [
+            f"task_type: {self.task_type}",
+            f"capability: {self.capability}",
+            f"description: {self.description}",
+            f"preconditions: {self.preconditions}",
+        ]
+        # 示例任务描述作为检索向量维度（§5.5.1），取前 3 条避免噪声
+        if self.example_tasks:
+            parts.append(f"example_tasks: {'; '.join(self.example_tasks[:3])}")
+        return "\n".join(parts)
 
     def mdl(self, alpha: float = 1.0, beta: float = 0.5, gamma: float = 0.3) -> float:
         """Minimum Description Length prior score (§2.2).

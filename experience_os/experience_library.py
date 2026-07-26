@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS trajectories (
     seq             INTEGER PRIMARY KEY AUTOINCREMENT,
     logged_at       REAL NOT NULL,
     experiment_id   TEXT NOT NULL,
-    method          TEXT NOT NULL,          -- vanilla | react | autoharness | skillopt
+    method          TEXT NOT NULL,          -- vanilla | react | coe | skillopt
     domain          TEXT NOT NULL,
     task_id         TEXT NOT NULL,
     task_type       TEXT NOT NULL,
@@ -59,6 +59,45 @@ CREATE INDEX IF NOT EXISTS idx_traj_exp  ON trajectories(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_traj_type ON trajectories(task_type);
 CREATE INDEX IF NOT EXISTS idx_traj_succ ON trajectories(success);
 CREATE INDEX IF NOT EXISTS idx_traj_meth ON trajectories(method);
+
+-- ========== 底层：子步骤（独立一等实体） ==========
+CREATE TABLE IF NOT EXISTS substeps (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+    trajectory_id   TEXT NOT NULL,         -- FK to trajectories.task_id
+    experiment_id   TEXT NOT NULL,
+    plan_idx        INTEGER NOT NULL,      -- 在 Plan 中的位置（0-based）
+    intent          TEXT NOT NULL,         -- "lookup_user_by_email"
+    tool_name       TEXT NOT NULL,         -- "find_user_id_by_email"
+    -- 三要素检索签名
+    input_schema    TEXT,                  -- JSON: {"requires":["email"],"from":"task"}
+    output_schema   TEXT,                  -- JSON: {"produces":["user_id"],"type":"str"}
+    effect          TEXT DEFAULT 'read_only', -- read_only | write | mixed
+    -- 执行记录
+    params_json     TEXT,
+    result_json     TEXT,
+    success         INTEGER DEFAULT 0,
+    execution_mode  TEXT DEFAULT 'agent',  -- agent | harness | plan
+    tokens_used     INTEGER DEFAULT 0,
+    -- 全路径历史
+    artifact_id     TEXT,                  -- 使用的 harness ID（如有）
+    artifact_version INTEGER,
+    failure_type    TEXT,                  -- F1-F4（harness 失败时）
+    source          TEXT DEFAULT 'react',  -- react | plan_execute | harness | llm_glue
+    meta_json       TEXT,                  -- plan JSON / glue code / decompose prompt 等
+    -- 父任务上下文（用于贝叶斯权重）
+    parent_task_type     TEXT,
+    parent_task_success  INTEGER DEFAULT 0,
+    -- 向量
+    intent_embedding BLOB,                 -- float32 向量
+    embedding_model  TEXT,
+    logged_at        REAL
+);
+CREATE INDEX IF NOT EXISTS idx_substeps_intent   ON substeps(intent);
+CREATE INDEX IF NOT EXISTS idx_substeps_tool     ON substeps(tool_name, experiment_id);
+CREATE INDEX IF NOT EXISTS idx_substeps_parent   ON substeps(trajectory_id);
+CREATE INDEX IF NOT EXISTS idx_substeps_io       ON substeps(effect, input_schema);
+CREATE INDEX IF NOT EXISTS idx_substeps_artifact ON substeps(artifact_id);
+CREATE INDEX IF NOT EXISTS idx_substeps_source   ON substeps(source);
 
 -- ========== 中层：经验记录（版本化） ==========
 CREATE TABLE IF NOT EXISTS records (
@@ -143,6 +182,37 @@ class TrajectoryRecord:
     messages_json: str = ""  # 完整对话
     steps_json: str = ""
     meta: dict = field(default_factory=dict)
+
+
+@dataclass
+class SubStepRecord:
+    """子步骤的持久化记录（对应 ``substeps`` 表）。
+
+    子步骤是一等实体：独立于全任务结果，可跨任务类型检索。
+    """
+    trajectory_id: str
+    experiment_id: str
+    plan_idx: int
+    intent: str
+    tool_name: str
+    input_schema: str = ""
+    output_schema: str = ""
+    effect: str = "read_only"
+    params_json: str = ""
+    result_json: str = ""
+    success: bool = False
+    execution_mode: str = "agent"
+    tokens_used: int = 0
+    artifact_id: str = ""
+    artifact_version: int = 0
+    failure_type: str = ""
+    source: str = "react"
+    meta_json: str = ""
+    parent_task_type: str = ""
+    parent_task_success: bool = False
+    intent_embedding: Optional[bytes] = None
+    embedding_model: str = ""
+    logged_at: float = 0.0
 
 
 def serialize_messages(messages: list[Any]) -> str:
@@ -272,6 +342,173 @@ class ExperienceLibrary:
         col_names = [d[0] for d in self.conn.execute(
             f"SELECT {cols} FROM trajectories LIMIT 0").description]
         return [dict(zip(col_names, r)) for r in rows]
+
+    # ==================================================================
+    # 底层：子步骤（独立一等实体）
+    # ==================================================================
+    def log_substep(self, rec: SubStepRecord) -> int:
+        """写入单条子步骤记录。"""
+        intent_blob: Optional[bytes] = None
+        if rec.intent_embedding is not None:
+            intent_blob = rec.intent_embedding
+        c = self.conn.execute(
+            """INSERT INTO substeps
+               (trajectory_id, experiment_id, plan_idx, intent, tool_name,
+                input_schema, output_schema, effect,
+                params_json, result_json, success, execution_mode, tokens_used,
+                artifact_id, artifact_version, failure_type, source, meta_json,
+                parent_task_type, parent_task_success,
+                intent_embedding, embedding_model, logged_at)
+               VALUES (?,?,?,?,?, ?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?, ?,?,?)""",
+            (
+                rec.trajectory_id, rec.experiment_id, rec.plan_idx,
+                rec.intent, rec.tool_name,
+                rec.input_schema, rec.output_schema, rec.effect,
+                rec.params_json, rec.result_json,
+                int(rec.success), rec.execution_mode, rec.tokens_used,
+                rec.artifact_id, rec.artifact_version,
+                rec.failure_type, rec.source, rec.meta_json,
+                rec.parent_task_type, int(rec.parent_task_success),
+                intent_blob, rec.embedding_model, time.time(),
+            ),
+        )
+        self.conn.commit()
+        return c.lastrowid
+
+    def log_substeps_batch(self, records: list[SubStepRecord]) -> list[int]:
+        """批量写入子步骤记录。"""
+        ids = []
+        for rec in records:
+            ids.append(self.log_substep(rec))
+        return ids
+
+    def query_substeps_by_intent(
+        self, intent: str, *, experiment_id: str = "", limit: int = 100,
+    ) -> list[dict]:
+        """按意图查询子步骤记录。"""
+        sql = "SELECT * FROM substeps WHERE intent=?"
+        params: list = [intent]
+        if experiment_id:
+            sql += " AND experiment_id=?"
+            params.append(experiment_id)
+        sql += " ORDER BY logged_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(sql, params).fetchall()
+        col_names = [d[0] for d in self.conn.execute(
+            "SELECT * FROM substeps LIMIT 0").description]
+        return [dict(zip(col_names, r)) for r in rows]
+
+    def aggregate_substep_patterns(
+        self, *, experiment_id: str = "", min_support: int = 0,
+    ) -> list[dict]:
+        """从 substeps 表聚合子步骤模式（贝叶斯权重）。
+
+        返回每个 ``(intent, tool_name)`` 组合的统计：
+        - support_count: 去重轨迹数
+        - success_count: 单步成功的执行次数
+        - success_in_full_tasks: 在成功全任务中的出现次数
+        - total_appearances: 在任何全任务中的出现次数
+        - bayesian_score: 贝叶斯可信度（α=1, β=1）
+        """
+        sql = """SELECT
+            intent, tool_name, effect,
+            COUNT(DISTINCT trajectory_id) AS support_count,
+            SUM(success) AS success_count,
+            SUM(CASE WHEN parent_task_success=1 THEN 1 ELSE 0 END) AS success_in_full_tasks,
+            COUNT(*) AS total_appearances,
+            COUNT(DISTINCT trajectory_id) as total_trajectories
+        FROM substeps
+        WHERE 1=1"""
+        params: list = []
+        if experiment_id:
+            sql += " AND experiment_id=?"
+            params.append(experiment_id)
+        sql += """ GROUP BY intent, tool_name
+        HAVING support_count >= ?
+        ORDER BY support_count DESC"""
+        params.append(min_support if min_support > 0 else 1)
+
+        rows = self.conn.execute(sql, params).fetchall()
+        col_names = [d[0] for d in self.conn.execute(
+            "SELECT intent, tool_name, effect, 0 as support_count, 0 as success_count, "
+            "0 as success_in_full_tasks, 0 as total_appearances, 0 as total_trajectories "
+            "FROM substeps LIMIT 0").description]
+
+        results = []
+        for row in rows:
+            d = dict(zip(col_names, row))
+            sc = d["success_count"] or 0
+            ta = d["total_appearances"] or 0
+            sft = d["success_in_full_tasks"] or 0
+            d["success_rate"] = sc / ta if ta > 0 else 0.0
+            # Bayesian score: Beta-Binomial with α=1, β=1
+            alpha, beta = 1.0, 1.0
+            d["bayesian_score"] = (alpha + sft) / (alpha + beta + ta) if (alpha + beta + ta) > 0 else 0.0
+            results.append(d)
+
+        return results
+
+    def migrate_substeps_from_trajectories(self, experiment_id: str = "") -> int:
+        """从已有轨迹的 steps_json 字段回填 substeps 表。
+
+        遍历所有轨迹，解析其 steps_json（如有），为每个 step 创建
+        一条 SubStepRecord。已存在的记录（相同 trajectory_id + plan_idx）跳过。
+
+        Returns: 新创建的子步骤数量。
+        """
+        import json as _json
+
+        sql = "SELECT task_id, experiment_id, task_type, success, steps_json FROM trajectories"
+        params: list = []
+        if experiment_id:
+            sql += " WHERE experiment_id=?"
+            params.append(experiment_id)
+
+        created = 0
+        for row in self.conn.execute(sql, params).fetchall():
+            task_id, exp_id, task_type, task_success, steps_json_str = row
+            if not steps_json_str:
+                continue
+            try:
+                steps = _json.loads(steps_json_str) if isinstance(steps_json_str, str) else steps_json_str
+            except Exception:
+                continue
+
+            if not isinstance(steps, list):
+                continue
+
+            for i, step in enumerate(steps):
+                # Skip if already exists
+                existing = self.conn.execute(
+                    "SELECT seq FROM substeps WHERE trajectory_id=? AND plan_idx=?",
+                    (task_id, i),
+                ).fetchone()
+                if existing:
+                    continue
+
+                action = step.get("action", "") if isinstance(step, dict) else getattr(step, "action", "")
+                tool_name = action.split("(")[0].strip() if action else ""
+                intent = (step.get("sub_step_intent", "") or tool_name) if isinstance(step, dict) else (
+                    getattr(step, "sub_step_intent", "") or tool_name
+                )
+
+                rec = SubStepRecord(
+                    trajectory_id=task_id,
+                    experiment_id=exp_id,
+                    plan_idx=i,
+                    intent=intent,
+                    tool_name=tool_name,
+                    success=bool(step.get("result", "")) and "Error" not in str(step.get("result", ""))
+                        if isinstance(step, dict) else False,
+                    execution_mode="agent",
+                    parent_task_type=task_type,
+                    parent_task_success=bool(task_success),
+                )
+                self.log_substep(rec)
+                created += 1
+
+        log.info("Substep migration: %d records created", created)
+        return created
 
     # ==================================================================
     # 中层：经验记录

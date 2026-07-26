@@ -21,7 +21,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from experience_os.llm import LLMClient
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from experience_os.services import EmbeddingService
+    from experience_os.models import SubStepPattern
+
+from experience_os.llm import LLMClient  # backward compat
 from experience_os.models import EnvironmentSnapshot, Harness
 from experience_os.repository import Repository
 
@@ -43,14 +48,44 @@ class RetrievalResult:
 
 
 class RuntimeRouter:
-    """Selects a harness for a given task, or signals agent fallback."""
+    """Selects a harness for a given task, or signals agent fallback.
+
+    支持两种初始化方式：
+    - 新方式：``RuntimeRouter(repo, services=svc)`` — 用 ``Services`` 依赖注入
+    - 旧方式：``RuntimeRouter(repo, llm=client)`` — 向后兼容
+    """
 
     SOFT_KEYS = {"version", "browser", "screen_resolution", "latency"}
 
-    def __init__(self, repo: Repository, llm: LLMClient, top_k: int = 5) -> None:
+    # 四层降级的 embedding 阈值
+    HIGH_CONF_THRESHOLD = 0.85   # cosine ≥ 此值 → 直接使用，不消耗 LLM
+    LOW_CONF_THRESHOLD = 0.65    # cosine < 此值 → 直接回退 ReAct，不浪费 LLM
+
+    def __init__(
+        self, repo: Repository,
+        llm: Optional[LLMClient] = None,
+        services: Optional[Any] = None,
+        top_k: int = 5,
+    ) -> None:
         self.repo = repo
-        self.llm = llm
+        self._llm = llm
+        self._services = services
         self.top_k = top_k
+
+    @property
+    def llm(self) -> LLMClient:
+        """向后兼容：返回 LLMClient（老代码路径）。"""
+        if self._llm is not None:
+            return self._llm
+        if self._services is not None:
+            return self._services.llm._client  # type: ignore[union-attr]
+        raise RuntimeError("RuntimeRouter: neither llm nor services provided")
+
+    @property
+    def embed(self) -> "EmbeddingService":
+        if self._services is not None:
+            return self._services.embed
+        raise RuntimeError("RuntimeRouter: services not provided for embedding")
 
     # ------------------------------------------------------------------
     # embedding cache
@@ -148,3 +183,99 @@ class RuntimeRouter:
                 None, MatchLevel.NONE, 0.0, "precondition mismatch on all candidates"
             )
         return RetrievalResult(None, MatchLevel.NONE, 0.0, "no harnesses in registry")
+
+    # ------------------------------------------------------------------
+    # 四层子步骤意图检索（§2.1）
+    # ------------------------------------------------------------------
+    def retrieve_substep_harness(
+        self,
+        intent: str,
+        available_inputs: set[str] | None = None,
+        needed_outputs: set[str] | None = None,
+        effect_constraint: str | None = None,
+    ) -> RetrievalResult:
+        """按四层降级策略检索匹配的子步骤 harness。
+
+        返回 ``RetrievalResult``，其中 ``level`` 表示匹配置信度：
+        - FULL:   exact match 或 embedding ≥ 0.85
+        - SOFT:   embedding 模糊匹配 (0.65~0.85)，需 LLM 评估
+        - NONE:   无匹配，应回退 ReAct
+        """
+        from experience_os.models import SubStepPattern
+
+        # 收集已知的子步骤模式（从 harness registry + substeps 聚合）
+        patterns = self._gather_substep_patterns()
+
+        # Layer 1: exact match
+        exact = next((p for p in patterns if p.intent == intent), None)
+        if exact is not None:
+            h = self.repo.get_harness_for_capability(exact.intent)
+            if h:
+                return RetrievalResult(h, MatchLevel.FULL, 1.0,
+                                       f"exact intent match: {exact.intent}")
+
+        # Layer 2a/2b/2c: embedding matching
+        try:
+            high, fuzzy, rejected = self.embed.match_intent(
+                intent, patterns,
+                high_threshold=self.HIGH_CONF_THRESHOLD,
+                low_threshold=self.LOW_CONF_THRESHOLD,
+            )
+        except RuntimeError:
+            # No embedding service available — fall back to exact only
+            return RetrievalResult(None, MatchLevel.NONE, 0.0,
+                                   "no embedding service, exact match only")
+
+        # Layer 2a: high confidence → use directly
+        if high:
+            best_pattern, sim = high[0]
+            # Also check input/output signature compatibility
+            if self._check_io_signature(best_pattern, available_inputs, needed_outputs):
+                h = self.repo.get_harness_for_capability(best_pattern.intent)
+                if h:
+                    return RetrievalResult(h, MatchLevel.FULL, sim,
+                                           f"embedding match (cos={sim:.2f}): {best_pattern.intent}")
+                # Pattern exists but no harness yet → SOFT (need induction)
+                return RetrievalResult(None, MatchLevel.SOFT, sim * 0.8,
+                                       f"candidate pattern, no harness yet: {best_pattern.intent}")
+
+        # Layer 2b: fuzzy → flag for LLM evaluation (caller decides)
+        if fuzzy:
+            best_pattern, sim = fuzzy[0]
+            if self._check_io_signature(best_pattern, available_inputs, needed_outputs):
+                return RetrievalResult(None, MatchLevel.SOFT, sim,
+                                       f"fuzzy match, needs LLM eval: {best_pattern.intent}")
+
+        # Layer 2c: low confidence → reject
+        if rejected:
+            return RetrievalResult(None, MatchLevel.NONE, rejected[0].support_count / 10.0 if hasattr(rejected[0], 'support_count') else 0.0,
+                                   f"no match (best cos < {self.LOW_CONF_THRESHOLD}), fallback to ReAct")
+
+        return RetrievalResult(None, MatchLevel.NONE, 0.0, "no sub-step pattern match")
+
+    def _gather_substep_patterns(self) -> list:
+        """收集所有已知子步骤模式（从 harness registry 聚合）。"""
+        from experience_os.models import SubStepPattern
+        patterns: list[SubStepPattern] = []
+
+        # 从活跃 harness 中提取子步骤模式
+        for h in self.repo.active_harnesses():
+            if h.capability and h.capability not in [p.intent for p in patterns]:
+                p = SubStepPattern(
+                    intent=h.capability,
+                    action_name=h.name,
+                    description=h.description,
+                )
+                patterns.append(p)
+
+        return patterns
+
+    @staticmethod
+    def _check_io_signature(
+        pattern, available_inputs: set[str] | None, needed_outputs: set[str] | None,
+    ) -> bool:
+        """检查子步骤模式的输入/输出签名与需求的匹配度。"""
+        if available_inputs is None and needed_outputs is None:
+            return True  # no constraints → always match
+        # TODO: parse pattern's input_schema / output_schema for precise matching
+        return True

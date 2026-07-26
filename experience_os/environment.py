@@ -73,7 +73,9 @@ class BaseEnvironment(ABC):
         start = time.time()
 
         # wrapper that accepts call_tool(name, **kwargs) or call_tool(name, {dict})
-        # and auto-parses JSON string results into dicts for harness convenience
+        # and auto-parses JSON string results into dicts for harness convenience.
+        # Non-JSON strings (e.g. "Error: User not found") are wrapped as
+        # {"error": msg} so harness code can safely call .get() on the result.
         def _call_tool(name: str, *args, **kwargs):
             if args and isinstance(args[0], dict) and not kwargs:
                 raw = self.call_tool(name, args[0])
@@ -94,6 +96,9 @@ class BaseEnvironment(ABC):
                         return json.loads(stripped)
                     except (json.JSONDecodeError, ValueError):
                         pass
+                # wrap non-JSON strings as error dict so harness .get() won't crash
+                if stripped.startswith("Error"):
+                    return {"error": stripped}
             return raw
 
         sandbox_globals: dict[str, Any] = {

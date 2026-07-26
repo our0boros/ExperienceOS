@@ -6,25 +6,6 @@
 
 ---
 
-## 0. 文档定位与基准声明
-
-| 历史文档 | 状态 | 说明 |
-|---------|------|------|
-| `OVERALL.md` | **已整合，待删除** | 内容已纳入本文档，git 历史存档 |
-| `STRUCTURE.md` | **已整合，待删除** | 实现差距部分纳入 §10，git 历史存档 |
-| `Executable Experience RP.md` | **已整合，待删除** | 研究提案部分纳入本文档，git 历史存档 |
-| `Executable Experience Discuss.md` | **保留为历史讨论** | 保留早期方向推演过程，但**不作为实施依据**，仅作历史参考 |
-| `CLAUDE.md` | **待同步更新** | 工程开发指引，名称/数据结构需与本文档对齐 |
-
-**关键收敛决策**（解决历史文档冲突）：
-
-1. **项目名称**：统一为 **ExperienceOS**。框架名、系统名、论文方法名均使用 ExperienceOS，废弃 "AutoHarness" 作为系统/方法名的历史用法（在历史文档中保留可追溯）。
-2. **核心数据结构**：统一采用**扩展 Hoare Triple** `H = ⟨P, steps, I, Q, R⟩` 作为 Harness 的形式化定义。废弃并行的 Artifact Object Schema yaml 与 Experience Object `E=(C,S,A,V,P)` 两套定义。
-3. **"层次"概念**：本文档明确区分**经验表示层次**（Layer 0–3 数据结构）与**归纳层次**（SubStep / Task / Composite 触发归纳的对象粒度）两个正交维度，详见 §3。
-4. **论文边界**：当前论文只证明 Level 0+1 归纳 + 单层 Registry + 单层运行时在 τ-bench 上"Token 成本显著下降，成功率不降"。多 Agent、跨环境、Composite 归纳、纵横版本树、User/Org/Global 三层覆盖等作为 Future Work。
-
----
-
 ## 1. 一句话定位
 
 > **ExperienceOS 是一个跨 Agent、跨环境的知识编译与共享运行时，它将任意 Agent 的执行经验自动编译为可复用的确定性 Harness（扩展 Hoare Triple），并通过层级化经验仓库使高级 Agent 归纳的经验可被低级 Agent 直接调用。**
@@ -161,6 +142,13 @@ class TrajectoryStep:
     # 状态快照（不变量挖掘用）
     pre_state_snapshot: StateHash
     post_state_snapshot: StateHash
+
+> **关于 `sub_step_plan` / StructuredCoT（结构化推理链）的可选性说明**：
+> - `sub_step_plan`（即 StructuredCoT / 结构化推理链）是**可选的辅助功能，默认不启用**。
+> - **并非所有 LLM 都支持 CoT（Chain of Thought）能力**，框架不依赖 CoT 也能正常工作。
+> - 当模型支持 CoT 时，`sub_step_plan` 可作为归纳引擎的辅助输入，提供约束（constraint）/风险（risk）/里程碑（milestone）等结构化信号，提升归纳质量。
+> - 当模型不支持 CoT 时，框架仅依赖 `goal` 字段（任务描述）与轨迹本身进行归纳，`sub_step_plan` 及其他 CoT 相关字段为空（`None`）。
+> - 当前阶段先忽略 StructuredCoT 的完整填充，后续可按需启用。
 
 @dataclass
 class EnvContext:
@@ -986,46 +974,66 @@ y 轴：滚动平均成功率
 
 ## 10. 当前实现状态与差距地图
 
+> **最后更新**：2026-07-25（exp-0001 端到端验证通过后）
+
 ### 10.1 已实现模块
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| `models.py` Hoare Triple | ✅ | `H=<P,steps,I,Q,R>` 完整 |
-| `storage.py` SQLite + 向量 BLOB | ✅ | 含 JSON 迁移 |
-| `embedding.py` 三级回退 | ✅ | Qwen3-Embedding-8B → ollama → hash |
-| `env_info.py` 环境元数据收集 | ✅ | OS/Python/硬件/模型/包版本 |
-| `agent.py` F1-F4 失败分类 | ✅ | + Agent Fallback |
-| `runtime.py` 双模式 | ✅ | ACCUMULATION / DEPLOYMENT |
-| τ-bench 集成 | ✅ | 仿真 + 轨迹转换 + DB hash 验证 |
-| Warmup/Eval 数据划分 `split_tasks()` | ✅ | |
-| `support_count >= 3` 触发 new_harness | ✅ | |
-| `F2 >= 2` 触发 patch | ✅ | |
-| Phase 5 LLM 合成 + Phase 6 沙盒回放 | ✅ | |
-| 子步骤提取/模式发现/ArtifactJudge | ⚠️ | 已实现但端到端验证待测试 |
-| `compare.py` Baseline 对比框架 | ✅ | GLM 5.2 验证通过 |
-| `curve.py` 积累曲线图 | ✅ | |
-| `experience_library.py` LTS + 实验库 | ✅ | |
+| `models.py` Hoare Triple | ✅ | `H=<P,steps,I,Q,R>` 完整，含 4 层 dataclass |
+| `storage.py` SQLite + 向量 BLOB | ✅ | 8 张表，float32 BLOB，含 JSON 迁移 |
+| `embedding.py` 三级回退 | ✅ | Qwen3-Embedding-8B → ollama → hash，SQLite 缓存 |
+| `env_info.py` 环境元数据收集 | ✅ | OS/Python/硬件/模型/包版本，结构化 SQLite |
+| `agent.py` F1-F4 失败分类 + Agent Fallback | ✅ | ReAct 风格，含工具调用解析 |
+| `runtime.py` ACCUMULATION/DEPLOYMENT 双模式 | ✅ | 含 HarnessRegistry 子步骤拦截 |
+| τ-bench 集成（`tau2_adapter.py`） | ✅ | 仿真 + 轨迹转换 + DB hash 验证 |
+| Warmup/Eval 数据划分 `split_tasks()` | ✅ | 4 种实验变体 |
+| `support_count >= 3` → new_harness 触发 | ✅ | `inductor.py` |
+| `F2 >= 2` → patch 触发 | ✅ | `inductor.py` |
+| Phase 0: 子步骤模式发现 | ✅ | `inductor.py::_discover_substep_patterns()` |
+| ArtifactJudge（子步骤价值评估） | ✅ | `inductor.py::_judge_artifact_value()`，LLM 四标准判断 |
+| Phase 1: 轨迹分段 | ✅ | `algorithms.py::_segment()` LLM 分段 + `_lcs_align()` 对齐，结果传递到后续阶段 |
+| Phase 2: 前置条件交集 | ✅ | `algorithms.py::_intersect_preconditions()` 跨轨迹取交集 |
+| Phase 3: Daikon 风格不变量挖掘 | ✅ | `algorithms.py::_mine_invariants()`：first/last action、步数、工具序列、常量参数、结果模式 |
+| Phase 4: LCS + 类型感知参数化 | ✅ | `algorithms.py::_lcs_pairs()` + `_lcs_align()` + `_abstract_steps()`（JSON 解析 + 参数键交集） |
+| Phase 5: LLM 代码合成 | ✅ | `inductor.py::_synthesize()` 含修复上下文注入 |
+| Phase 6: 沙盒回放验证 | ✅ | `inductor.py::_validate()` 逐轨迹独立环境验证，`env_builder` 模式 |
+| Phase 7: 变体检测 | ✅ | `inductor.py::_detect_variations()` 工具序列差异检测 |
+| NEEDS_REVISION 修复重试循环 | ✅ | `inductor.py:528-603`，最多 2 次修复，收集错误上下文 |
+| HarnessRegistry（O(1) intent→harness） | ✅ | `harness_registry.py`，含调用统计 |
+| `repository.py` SQLite 存储 | ✅ | 使用 `Storage`（SQLite）+ dict 缓存双重机制 |
+| `experience_library.py` LTS + 实验库 | ✅ | 两级 SQLite：`lts_library.db` + `exp_<id>.db` |
+| `compare.py` Baseline 对比框架 | ✅ | 4 方法（vanilla / react / skillopt / coe）× 4 变体 |
+| SkillOpt τ2 adapter | ✅ | `compare.py::run_skillopt()` skill 文本注入 agent 系统提示 |
+| Vanilla LLM baseline | ✅ | `compare.py::run_vanilla()` 单轮 LLM |
+| `curve.py` 积累/成本曲线图 | ✅ | SR 曲线 + 双面板 token 收敛 |
+| 模型迁移实验脚本 | ✅ | `scripts/run_transfer_experiment.py` |
+| **exp-0001 端到端验证通过** | ✅ | GLM-5.2 + retail exchange 任务，harness APPROVED，详见 §10.6 |
 
 ### 10.2 P0 缺口（必须在论文提交前修复）
 
-| 缺口 | 影响 |
-|------|------|
-| Phase 1 分段结果被丢弃（compiler.py） | 多步轨迹无法正确分段 |
-| Phase 3 不变量仅"首步一致+全成功"启发式 | 不变量挖掘质量不足 |
-| Phase 4 参数化用正则替换，非 LCS | 真实多步轨迹参数化质量差 |
-| SkillOpt τ2 adapter 未集成 | 无法与最强 baseline 对比 |
-| Vanilla LLM / RAG baseline 未实现 | 对比实验不完整 |
-| `repository.py` 未真正接入 SQLite（仅 JSON） | 存储架构与设计不符 |
+> **状态**：原有 6 个 P0 缺口已在代码中解决。仅剩 1 项。
+
+| 缺口 | 影响 | 状态 |
+|------|------|------|
+| ~~Phase 1 分段结果被丢弃~~ | 多步轨迹无法正确分段 | ✅ 已修复：`algorithms.py::_segment()` + `_lcs_align()`，结果在 inductor 中使用 |
+| ~~Phase 3 不变量仅启发式~~ | 不变量挖掘质量不足 | ✅ 已修复：`algorithms.py::_mine_invariants()` Daikon 风格动态检测 |
+| ~~Phase 4 参数化用正则替换~~ | 真实多步轨迹参数化质量差 | ✅ 已修复：LCS + 类型感知（JSON 解析 + 参数键交集） |
+| ~~SkillOpt τ2 adapter 未集成~~ | 无法与最强 baseline 对比 | ✅ 已修复：`compare.py::run_skillopt()` |
+| ~~Vanilla LLM baseline 未实现~~ | 对比实验不完整 | ✅ 已修复：`compare.py::run_vanilla()` |
+| ~~`repository.py` 未接入 SQLite~~ | 存储架构与设计不符 | ✅ 已修复：`Storage`（SQLite）+ dict 缓存 |
+| **RAG baseline 未实现** | 缺少与检索增强方案的对比 | ❌ 待实现：`compare.py` 中无 `run_rag()` |
 
 ### 10.3 P1 缺口（影响结果质量，有降级方案）
 
-| 缺口 | 影响 |
-|------|------|
-| NEEDS_REVISION 无修复重试循环 | 归纳失败即放弃 |
-| `new_variation_detected` 特化分裂未触发 | 环境漂移未处理 |
-| `StructuredCoT` 仅填 `goal` 字段 | 缺少 constraint/unknown/risk 信号 |
-| 版本 DAG 缺 `specialization` / `composition` 边 | 版本管理不完整 |
-| 检索向量缺 `example_tasks` 维度 | 检索质量可提升 |
+| 缺口 | 影响 | 状态 |
+|------|------|------|
+| ~~NEEDS_REVISION 无修复重试循环~~ | 归纳失败即放弃 | ✅ 已修复：`inductor.py:528-603`，最多 2 次修复 |
+| ~~`new_variation_detected` 特化分裂未触发~~ | 环境漂移未处理 | ✅ 已修复：`inductor.py::_detect_variations()` |
+| `StructuredCoT` 缺 `unknowns` 字段 | 缺少"未知信息"信号 | ⚠️ 部分：goal/constraints/risk/milestones 已提取，`unknowns` 未填充（**可选辅助功能**） |
+| 版本 DAG 欠丰富（仅 patch 边有实际用例） | specialization/composition 边 schema 就绪但未在实验中使用 | ⚠️ Schema 就绪，等更多场景触发 |
+| 检索向量缺 `example_tasks` 维度 | 检索精度可提升 | ❌ 未修复 |
+| 双 embedding 路径未统一 | `retriever.py` 用 `LLMClient.embed()`，`embedding.py` 有更丰富的 `EmbeddingClient` 未复用 | ❌ 技术债务 |
 
 ### 10.4 P2 缺口（Future Work，不影响核心实验）
 
@@ -1036,27 +1044,83 @@ y 轴：滚动平均成功率
 | 归纳异步化 | Future Work |
 | TerminalBench 适配器 | Future Work |
 | 独立向量数据库（FAISS/ChromaDB） | Future Work |
+| Composite 归纳（Level 2） | Future Work |
+| 跨 Agent 共享 | Future Work |
 
 ### 10.5 差距修复路线图
 
-**阶段一（P0，论文提交前）**：
-1. Phase 4 参数化：正则 → LCS + 类型感知
-2. Phase 1 分段结果实际传递到后续阶段
-3. SkillOpt τ2 adapter 集成
-4. Vanilla LLM baseline 实现
-5. `repository.py` 接入 SQLite
+**阶段一（P0，论文提交前）** — ✅ 全部完成（2026-07-25 验证）
 
-**阶段二（P1，提升结果质量）**：
-1. Phase 3 Daikon 风格不变量挖掘
-2. NEEDS_REVISION 修复循环
-3. 版本 DAG 补 `specialization` 边
-4. `StructuredCoT` 完整字段填充
+1. ✅ Phase 4 参数化：正则 → LCS + 类型感知
+2. ✅ Phase 1 分段结果实际传递到后续阶段
+3. ✅ SkillOpt τ2 adapter 集成
+4. ✅ Vanilla LLM baseline 实现
+5. ✅ `repository.py` 接入 SQLite
+6. ❌ **剩余**：RAG baseline 实现
+
+**阶段二（P1，提升结果质量）** — ✅ 大部分完成
+
+1. ✅ Phase 3 Daikon 风格不变量挖掘
+2. ✅ NEEDS_REVISION 修复循环
+3. ✅ 版本 DAG schema 含 specialization/composition 边
+4. ⚠️ `StructuredCoT` `unknowns` 字段（可选，按需启用）
+5. ❌ 检索向量 `example_tasks` 维度
+6. ❌ 统一 embedding 路径
 
 **阶段三（P2，Future Work）**：
 1. Composite 归纳
 2. 多层级知识库
 3. 跨 Agent 共享
 4. 语义对齐四战场完整实现
+
+### 10.6 实验进展
+
+#### exp-0001：CoE 端到端 + baseline 对比（2026-07-25）
+
+- **配置**：GLM-5.2 / retail / `exchange_delivered_order_items` / train_test split
+- **结果**：harness APPROVED（validation `success_rate=1.0, test_count=3`），首次端到端跑通完整管线
+- **对比**（3 个 test 任务）：coe 66.7% vs react 66.7% — **成功率持平**
+- **Token**：coe 111K vs react 139K — 略低，但 harness 在 eval 阶段未直接判定成功（路径 `harness+agent: 2`），回退 agent 完成
+- **关键发现**：`extract_task_params` 仅从参考动作 `arguments` 提取参数，未解析 `user_scenario.instructions` 文本中的关键字段（email/name/zip），导致 harness 在 eval 阶段缺少入参
+- **详细记录**：[docs/exp/0001-coe-glm5.2-retail-exchange.md](docs/exp/0001-coe-glm5.2-retail-exchange.md)
+
+#### 后续实验规划（详见 §10.7）
+
+### 10.7 后续实验路线图
+
+基于 exp-0001 的发现，按优先级排列：
+
+**Phase A：修复关键瓶颈（1 个代码改动）**
+
+| 编号 | 任务 | 预期效果 |
+|------|------|---------|
+| A1 | `extract_task_params` 从 `user_scenario.instructions` 文本中解析参数（email/name/order_id 等），补充到 params | harness 在 eval 阶段获得完整入参，提升 harness 独立成功率 |
+
+**Phase B：扩大验证规模（300+ 任务）**
+
+| 编号 | 实验 | 配置 | 目标 |
+|------|------|------|------|
+| B1 | coe vs react 全量 | retail train=74 / test=40，DeepSeek-V4-Flash | 验证 harness 在更大样本上的 SR + Token 节省 |
+| B2 | 4 方法完整对比 | vanilla / react / skillopt / coe，retail，DeepSeek-V4-Flash | 产出论文核心对比表 |
+| B3 | 积累曲线 | coe + react，40 任务滚动窗口 | 验证"交叉点"核心主张 |
+
+**Phase C：泛化与迁移（论文增量贡献）**
+
+| 编号 | 实验 | 配置 | 目标 |
+|------|------|------|------|
+| C1 | 模型迁移：强→弱 | GLM-5.2 积累 → qwen2.5:7b 部署，retail full | 验证"强模型归纳，弱模型受益"（RQ2 模型骨架泛化） |
+| C2 | 跨域迁移 | retail 积累 → airline 部署 | 验证跨域泛化（RQ2 环境泛化） |
+| C3 | RAG baseline | retail，GLM-5.2 | 补全对比维度 |
+
+**Phase D：消融与鲁棒性（论文支撑）**
+
+| 编号 | 实验 | 配置 | 目标 |
+|------|------|------|------|
+| D1 | 无 sandbox 验证消融 | retail，GLM-5.2，跳过 Phase 6 | 证明验证门控的必要性 |
+| D2 | MIN_SUPPORT 敏感性 | retail，support={1,3,5,7} | 确定最佳触发阈值 |
+| D3 | 子步骤消融 | retail，GLM-5.2，禁用手步骤发现 | 证明 Phase 0 的贡献 |
+
+**优先级建议**：A1 → B1 → B2（产出初步论文数据）→ B3（积累曲线是核心图）→ C1（模型迁移是论文亮点）→ 其余按资源分配。
 
 ---
 
@@ -1188,7 +1252,7 @@ SQLite（primary，via `experience_library.py`）+ JSON（legacy，via `reposito
 
 - `tau2-bench/` — 主实验环境
 - `harbor-TerminalBench/` — 补充环境（适配器待实现）
-- `SkillOpt/` — 最强文本 baseline（τ2 adapter 待实现）
+- `SkillOpt/` — 最强文本 baseline（τ2 adapter 已实现：`compare.py::run_skillopt()`）
 
 ---
 

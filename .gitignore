@@ -16,6 +16,7 @@ env/
 
 # Local data (runtime state, not source)
 .experience_os_data/
+.experience_os_*/
 
 # Local model checkpoints (symlink to huge dir)
 models
@@ -34,6 +35,10 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Temp experiment output (large files)
+_*.txt
+_*.log
 
 # Secrets
 .env

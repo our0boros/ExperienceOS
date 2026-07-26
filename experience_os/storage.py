@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS trajectories (
     task_type TEXT NOT NULL,
     task_description TEXT,
     outcome TEXT,
+    phase TEXT DEFAULT '',
     steps_json TEXT,
     cot_json TEXT,
     env_snapshot_json TEXT,
@@ -181,6 +182,8 @@ class Storage:
         """初始化数据库 schema。"""
         conn = self._conn or sqlite3.connect(self.db_path)
         conn.executescript(_SCHEMA_SQL)
+        # 增量迁移：为旧库添加缺失列（如 phase）
+        self._migrate_columns(conn)
         # 记录 schema 版本
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
@@ -189,6 +192,17 @@ class Storage:
         conn.commit()
         self._conn = conn
         log.info("SQLite storage initialized at %s", self.db_path)
+
+    @staticmethod
+    def _migrate_columns(conn: sqlite3.Connection) -> None:
+        """增量添加缺失列（兼容旧库）。"""
+        # 检查 trajectories 表是否有 phase 列
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(trajectories)").fetchall()}
+        if "phase" not in cols:
+            try:
+                conn.execute("ALTER TABLE trajectories ADD COLUMN phase TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # 列已存在
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -209,12 +223,13 @@ class Storage:
         env = json.dumps(d.get("env_snapshot", {}), ensure_ascii=False)
         self.conn.execute(
             """INSERT OR REPLACE INTO trajectories
-            (id, task_id, task_type, task_description, outcome, steps_json,
+            (id, task_id, task_type, task_description, outcome, phase, steps_json,
              cot_json, env_snapshot_json, tokens_used, latency_seconds, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 d["id"], d.get("task_id", ""), d.get("task_type", ""),
                 d.get("task_description", ""), d.get("outcome", ""),
+                d.get("phase", ""),
                 steps, cot, env,
                 d.get("tokens_used", 0), d.get("latency_seconds", 0.0),
                 d.get("created_at", time.time()),
@@ -298,6 +313,50 @@ class Storage:
         if row and row[0]:
             return _unpack_vector(row[0])
         return None
+
+    # ==================================================================
+    # 经验记录存储
+    # ==================================================================
+    def save_record(self, record: Any) -> None:
+        """存储 ExperienceRecord（dataclass 或 dict）。"""
+        from experience_os.repository import _as_dict
+
+        d = _as_dict(record) if hasattr(record, "__dict__") else record
+        self.conn.execute(
+            """INSERT OR REPLACE INTO records
+            (id, task_type, preconditions_json, canonical_steps_json,
+             invariants_json, terminal_verifier, source_trajectories_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                d.get("id", ""), d.get("task_type", ""),
+                json.dumps(d.get("candidate_preconditions", d.get("preconditions", {})),
+                           ensure_ascii=False),
+                json.dumps(d.get("param_steps", d.get("canonical_steps", [])),
+                           ensure_ascii=False),
+                json.dumps(d.get("invariants", []), ensure_ascii=False),
+                d.get("terminal_verifier", ""),
+                json.dumps(d.get("source_trajectory_ids", []), ensure_ascii=False),
+                d.get("created_at", time.time()),
+            ),
+        )
+        self.conn.commit()
+
+    def load_records(self, task_type: str = "") -> list[dict]:
+        """查询经验记录。"""
+        sql = "SELECT * FROM records"
+        params: list = []
+        if task_type:
+            sql += " WHERE task_type = ?"
+            params.append(task_type)
+        sql += " ORDER BY created_at"
+        rows = self.conn.execute(sql, params).fetchall()
+        cols = [d[0] for d in self.conn.execute("SELECT * FROM records LIMIT 0").description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    def delete_record(self, record_id: str) -> None:
+        """删除经验记录。"""
+        self.conn.execute("DELETE FROM records WHERE id = ?", (record_id,))
+        self.conn.commit()
 
     # ==================================================================
     # 向量存储
@@ -427,6 +486,11 @@ class Storage:
         if row:
             return json.loads(row[0])
         return None
+
+    def load_all_stats(self) -> list[dict]:
+        """查询所有 task_type 的统计（返回含 task_type 和 stats_json 的行）。"""
+        rows = self.conn.execute("SELECT task_type, stats_json FROM stats").fetchall()
+        return [{"task_type": r[0], "stats_json": r[1]} for r in rows]
 
     # ==================================================================
     # 迁移：从 JSON 文件导入

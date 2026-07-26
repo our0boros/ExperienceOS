@@ -311,7 +311,7 @@ All embeddings cached in SQLite `embeddings` table by `text_hash → float32 BLO
 |--------|-------------|-----------------|
 | **vanilla** | Pure LLM, no tools | None (lower bound) |
 | **react** | τ-bench ReAct agent | None (current SotA) |
-| **autoharness** | ExperienceOS DEPLOYMENT mode (`autoharness` 为 CLI 方法标识符，保留以兼容代码) | Compiled Python code (ours) |
+| **coe** (Compilation of Experience) | ExperienceOS DEPLOYMENT mode | Compiled Python code (ours) |
 | **skillopt** | SkillOpt-optimized text skill | Text document (strongest baseline) |
 
 ### Data Split: Warmup vs Evaluation
@@ -346,7 +346,7 @@ y-axis: rolling average success rate
 Lines:
   - Vanilla agent: flat (no learning from experience)
   - RAG agent: slight upward (few-shot benefit)
-  - ExperienceOS (autoharness): flat during warmup, then significant rise at crossover point
+  - ExperienceOS (coe): flat during warmup, then significant rise at crossover point
   - Fixed harness (upper bound): highest from the start
 ```
 
