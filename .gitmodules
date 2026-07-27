@@ -7,3 +7,6 @@
 [submodule "SkillOpt"]
 	path = SkillOpt
 	url = https://github.com/our0boros/SkillOpt.git
+[submodule "KSI"]
+	path = KSI
+	url = https://github.com/recursive-knowledge/KSI.git
