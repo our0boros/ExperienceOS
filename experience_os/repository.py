@@ -1,4 +1,13 @@
-"""四层经验仓库 — SQLite 主存储。
+"""Domain repository facade over the SQLite driver.
+
+.. deprecated::
+    新代码应通过 ``stores.py`` 的 Store facade 访问数据：
+    - 轨迹写入 → ``TraceStore.append()``
+    - 经验归纳 → ``ExperienceStore.consolidate_substeps()``
+    - Artifact 管理 → ``ArtifactStore.log_artifact()``
+
+    本模块保留以支撑历史数据和 Runtime/Inductor 的向后兼容访问，
+    但不应再扩展新 API。
 
 Layer 0 — :class:`~experience_os.models.Trajectory`      (raw, append-only)
 Layer 1 — :class:`~experience_os.models.ExperienceRecord` (induced summaries)

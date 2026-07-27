@@ -1,6 +1,12 @@
-"""SQLite + 向量持久化存储层。
+"""SQLite driver for the Store layer.
 
-替代纯 JSON 文件存储，提供：
+.. deprecated::
+    本模块仅供 ``repository.py`` 和 ``experience_library.py`` 内部使用。
+    新代码不应直接调用 ``Storage``；请使用 ``stores.py`` 的 Store facade。
+
+本模块负责 SQLite 持久化、向量缓存和历史 JSON 数据迁移，不承担 domain facade 语义。
+
+提供：
   - 结构化查询（按 task_type、outcome、时间范围等）
   - 向量持久化（embedding 存为 BLOB）
   - 环境 metadata 存储
@@ -17,7 +23,7 @@
     ├── env_metadata    -- 环境 metadata 快照
     └── schema_version  -- schema 版本管理
 
-向后兼容：JSON 文件仍可通过 Repository 类读取，SQLite 是新增的首选存储。
+JSON 迁移仅用于导入历史数据；SQLite 是唯一运行时存储驱动。
 """
 
 from __future__ import annotations

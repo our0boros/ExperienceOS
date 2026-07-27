@@ -25,13 +25,13 @@ import time
 
 from experience_os.config import Config
 from experience_os.environment import TaskRequest
+from experience_os.input_resolver import ArtifactInputResolver
 from experience_os.models import Trajectory
 from experience_os.runtime import Runtime, SystemMode
 from experience_os.tau2_adapter import (
     Tau2Environment,
     _extract_task_description,
     convert_simulation,
-    extract_task_params,
     infer_task_type,
     run_tau2_simulation,
     split_tasks,
@@ -154,8 +154,9 @@ def run_tau2_demo(
 
     env = MockEnvironment()  # placeholder, tau2 环境按 task 独立构建
     rt = Runtime(config, env)
+    input_resolver = ArtifactInputResolver()
 
-    if not rt.llm.ping():
+    if not rt.services.chat.ping():
         print("[X] EOS LLM 不可达")
         return
     print("[OK] EOS LLM 可达")
@@ -279,7 +280,7 @@ def run_tau2_demo(
     for i, task in enumerate(evaluation, 1):
         task_type = infer_task_type(task)
         task_desc = _extract_task_description(task)
-        params = extract_task_params(task)
+        params = input_resolver.resolve(task, []).params
 
         print(f"\n  --- Eval {i}/{len(evaluation)}: task={task.id} type={task_type} ---")
         print(f"      {task_desc[:80]}")

@@ -502,11 +502,17 @@ def run_tau2_simulation(
     max_steps: int = 30,
     seed: int = 42,
     solo_mode: bool = False,
+    harness_registry=None,
 ) -> Any:
     """运行一次 τ-bench 仿真，返回 SimulationRun。
 
     使用 tau2 的 build_orchestrator + run_simulation API。
     LLM 通过 litellm 指向 ollama（或 DeepInfra）。
+
+    Args:
+        harness_registry: 可选 HarnessRegistry。传入后，tau2 agent 的每次
+                          工具调用会先检查 registry，若命中则执行 harness
+                          （绕过 LLM），未命中则正常走 tau2 环境。
     """
     from tau2.data_model.simulation import TextRunConfig
     from tau2.runner.build import build_orchestrator
@@ -531,179 +537,55 @@ def run_tau2_simulation(
     )
 
     orchestrator = build_orchestrator(config, task, seed=seed)
+
+    # 注入 harness 拦截：agent 调工具时先查 registry
+    intercept_count = 0
+    if harness_registry is not None and harness_registry.count > 0:
+        _wrap_env_for_harness(orchestrator.environment, harness_registry)
+
     result = run_simulation(orchestrator)
+    intercept_count = getattr(orchestrator.environment, '_harness_intercept_count', 0)
+    # Attach to result for caller inspection
+    result._harness_intercept_count = intercept_count
     return result
 
 
-def extract_task_params(task: Any) -> dict:
-    """从任务中提取参数，用于 Harness 执行。
+def _wrap_env_for_harness(env, registry) -> None:
+    """在 tau2 environment 的工具调用上注入 harness 拦截。
 
-    从多个来源提取，优先级从低到高：
-    1. user_scenario.instructions 文本 — 用户标识信息（email/name/zip）
-    2. user_scenario.instructions.known_info — 结构化已知信息（如有）
-    3. evaluation_criteria.actions[*].arguments — 参考动作参数（最高优先级）
+    Agent 每次调用 make_tool_call 时，先查 HarnessRegistry：
+    - 命中 → 执行 harness（绕过 LLM）
+    - 未命中 → 走原始 tau2 环境
 
-    Harness 代码通过 ``params`` 访问这些值。
+    设置 ``env._harness_intercept_count`` 供外部检查拦截次数。
     """
-    import re
+    original = env.make_tool_call
+    env._harness_intercept_count = 0
 
-    params: dict = {}
+    def _intercepted(name: str, *args, **kwargs):
+        harness = registry.lookup(name) if registry else None
+        if harness is not None:
+            try:
+                tool_kwargs = {k: v for k, v in kwargs.items()
+                               if k != "requestor"}
+                def _sandbox_call(n, *a, **kw):
+                    if a and isinstance(a[0], dict):
+                        return original(n, requestor="assistant", **a[0])
+                    return original(n, requestor="assistant", **kw)
+                sandbox: dict = {
+                    "call_tool": _sandbox_call,
+                    "params": tool_kwargs,
+                }
+                import json as _json
+                local_ns: dict = {}
+                exec(harness.procedure_code, sandbox, local_ns)  # noqa: S102
+                run_fn = local_ns.get("run") or local_ns.get("main")
+                if run_fn is not None:
+                    result = run_fn()
+                    env._harness_intercept_count += 1
+                    return env.to_json_str(result) if hasattr(env, "to_json_str") else _json.dumps(result)
+            except Exception:
+                pass  # harness 失败 → 回退原始调用
+        return original(name, *args, **kwargs)
 
-    # ── 来源 1: user_scenario.instructions 文本 ──
-    user_scenario = getattr(task, "user_scenario", None)
-    instruction_text = ""
-    if user_scenario:
-        instructions = getattr(user_scenario, "instructions", None)
-        if instructions is not None:
-            # 统一转为文本：兼容 StructuredUserInstructions 和纯 str
-            if isinstance(instructions, str):
-                instruction_text = instructions
-            else:
-                # StructuredUserInstructions → 拼接所有字段为文本
-                parts = []
-                for field in ("domain", "reason_for_call", "known_info",
-                              "unknown_info", "task_instructions"):
-                    val = getattr(instructions, field, None)
-                    if val:
-                        parts.append(str(val))
-                instruction_text = "\n".join(parts)
-
-                # known_info 可能包含结构化键值信息，单独解析
-                known_info = getattr(instructions, "known_info", None)
-                if known_info and isinstance(known_info, str):
-                    _extract_structured_pairs(known_info, params)
-
-    # 从指令文本中提取常见模式
-    if instruction_text:
-        text_params = _parse_instruction_text(instruction_text)
-        for k, v in text_params.items():
-            if k not in params:
-                params[k] = v
-
-    # ── 来源 2: evaluation_criteria.actions[*].arguments ──
-    # （最高优先级，可能覆盖上述文本提取的值）
-    criteria = getattr(task, "evaluation_criteria", None)
-    if criteria and getattr(criteria, "actions", None):
-        for action in criteria.actions:
-            if action.arguments:
-                params.update(action.arguments)
-
-    # ── 来源 3: initial_state.initialization_actions ──
-    initial_state = getattr(task, "initial_state", None)
-    if initial_state and getattr(initial_state, "initialization_actions", None):
-        for init_action in initial_state.initialization_actions:
-            init_args = getattr(init_action, "arguments", None)
-            if init_args:
-                for k, v in init_args.items():
-                    if k not in params:
-                        params[k] = v
-
-    # ── 来源 4: initial_state.initialization_data.user_data ──
-    if initial_state:
-        init_data = getattr(initial_state, "initialization_data", None)
-        if init_data:
-            user_data = getattr(init_data, "user_data", None)
-            if user_data and isinstance(user_data, dict):
-                for k, v in user_data.items():
-                    if k not in params:
-                        params[k] = v
-
-    return params
-
-
-def _parse_instruction_text(text: str) -> dict:
-    """从指令文本中提取常见参数模式。"""
-    import re
-
-    params: dict = {}
-
-    # Email: standard pattern
-    email_match = re.search(
-        r'\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b', text
-    )
-    if email_match:
-        params["email"] = email_match.group(0)
-
-    # ZIP code: 5-digit (possibly + 4), near "zip" keyword
-    zip_match = re.search(
-        r'(?:zip\s*(?:code)?\s*[:\s]*)(\d{5}(?:-\d{4})?)', text, re.IGNORECASE
-    )
-    if zip_match:
-        params["zip"] = zip_match.group(1)
-    else:
-        # Fallback: any 5-digit number in a reasonable context
-        zip_match = re.search(r'\b\d{5}(?:-\d{4})?\b', text)
-        if zip_match:
-            params["zip"] = zip_match.group(0)
-
-    # User ID: tau-bench convention — snake_case with 4+ digit suffix,
-    # appearing after "You are" or "I am" (known_info text)
-    user_id_match = re.search(
-        r'(?:You|I)\s+(?:am|are)\s+([a-z]+_[a-z]+_\d{4,})', text
-    )
-    if user_id_match:
-        params["user_id"] = user_id_match.group(1)
-
-    # Name patterns: "You are X Y" / "Your name is X Y" / "You're X Y"
-    name_patterns = [
-        r'You\s+are\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})',
-        r'Your\s+name\s+is\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})',
-        r"You're\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})",
-    ]
-    for pattern in name_patterns:
-        name_match = re.search(pattern, text)
-        if name_match:
-            name_parts = name_match.group(1).split()
-            if len(name_parts) >= 1:
-                params["first_name"] = name_parts[0]
-            if len(name_parts) >= 2:
-                params["last_name"] = name_parts[-1]
-            break
-
-    # Order ID: various formats (#W2378156, ORD-999, etc.)
-    # Captures the full identifier including # prefix when present
-    order_match = re.search(
-        r'order\s+(#[A-Z]*\d{3,})', text, re.IGNORECASE
-    )
-    if order_match:
-        params["order_id"] = order_match.group(1)
-    else:
-        # Fallback: standalone #NUMBER pattern
-        order_match = re.search(r'(#[A-Z]+\d{3,})', text)
-        if order_match:
-            params["order_id"] = order_match.group(1)
-        else:
-            order_match = re.search(r'(?:order\s+)([A-Z]+\d{3,})', text, re.IGNORECASE)
-            if order_match:
-                params["order_id"] = "#" + order_match.group(1)
-
-    return params
-
-
-def _extract_structured_pairs(text: str, params: dict) -> None:
-    """从结构化文本（如 known_info）中提取键值对。
-
-    支持的格式：
-    - ``Name: Sophia Silva``
-    - ``Email: sophia.silva@example.com``
-    - ``key: value`` (通用)
-    """
-    import re
-
-    # Key: Value lines
-    for match in re.finditer(
-        r'(email|name|first_name|last_name|zip|user_id|order_id|product_id|'
-        r'phone|address)[:\s]+(.+?)(?:\n|$)',
-        text,
-        re.IGNORECASE,
-    ):
-        key = match.group(1).lower().strip()
-        value = match.group(2).strip()
-        if key == "name":
-            parts = value.split()
-            if len(parts) >= 1:
-                params["first_name"] = parts[0]
-            if len(parts) >= 2:
-                params["last_name"] = parts[-1]
-        else:
-            params[key] = value
+    env.make_tool_call = _intercepted

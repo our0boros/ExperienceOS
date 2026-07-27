@@ -21,7 +21,7 @@ import time
 from typing import Optional
 
 from experience_os.environment import BaseEnvironment, TaskRequest
-from experience_os.llm import LLMClient
+from experience_os.services import ChatService
 from experience_os.models import (
     EnvironmentSnapshot,
     ExecutionResult,
@@ -47,7 +47,7 @@ Available tools:
 class AgentFallback:
     """A minimal ReAct-style LLM agent that uses tool calling."""
 
-    def __init__(self, llm: LLMClient, max_steps: int = 10) -> None:
+    def __init__(self, llm: ChatService, max_steps: int = 10) -> None:
         self.llm = llm
         self.max_steps = max_steps
 
@@ -138,22 +138,7 @@ class AgentFallback:
         request: TaskRequest,
     ) -> str:
         """Use native OpenAI tool-calling when supported by the backend."""
-        client = self.llm._client  # noqa: SLF001
-        resp = client.chat.completions.create(
-            model=self.llm.config.model,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            temperature=0.3,
-        )
-        msg = resp.choices[0].message
-        # if there's a tool call, serialise it into text for our parser
-        if msg.tool_calls:
-            tc = msg.tool_calls[0]
-            args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-            args_str = ", ".join(f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}" for k, v in args.items())
-            return f'{tc.function.name}({args_str})'
-        return msg.content or ""
+        return self.llm.tool_call(messages, tools)
 
     @staticmethod
     def _parse_tool_call(text: str) -> tuple[Optional[str], dict]:

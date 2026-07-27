@@ -185,6 +185,141 @@ class SubStepOutcome:
     params: dict[str, Any] = field(default_factory=dict)
     success: bool = False
     error: str = ""
+    # 预测契约验证（Phase A，来自 flow.md 融合）
+    prediction_verification: Optional[PredictionVerification] = None
+
+
+# =====================================================================
+# Prediction Contract (flow.md fusion — Phase A)
+# =====================================================================
+@dataclass
+class PredictionContract:
+    """Agent's structured prediction BEFORE executing a sub-step.
+
+    Maps to the Hoare Triple: expected_input → P, expected_output/effect → Q.
+    Derived from the agent's reasoning text immediately preceding a tool call.
+
+    Design reference: docs/ExperienceOS.md §5.1.1, flow.md §1.
+    """
+
+    step_id: str = ""
+    intent: str = ""                 # what sub-step this prediction is for
+    expected_input: str = ""         # natural-language expected input / precondition
+    expected_output: str = ""        # natural-language expected output / postcondition
+    expected_effect: str = ""        # expected side-effect (e.g. "order status changed")
+    confidence: float = 0.5          # agent's self-assessed confidence (0.0–1.0)
+    agent_reasoning: str = ""        # raw reasoning snippet this contract was extracted from
+
+
+@dataclass
+class PredictionVerification:
+    """Post-execution comparison: predicted (contract) vs actual (tool result).
+
+    Produces a quality label that feeds into Bayesian experience gating.
+    Design reference: docs/ExperienceOS.md §5.1.2.
+    """
+
+    contract: Optional[PredictionContract] = None
+    actual_output: str = ""          # actual tool result (truncated)
+    actual_effect: str = ""          # observed side-effect
+    prediction_accurate: bool = False
+    divergence_reason: str = ""      # why prediction and actual diverged (if they did)
+    quality_label: str = ""          # high_quality | lucky_success | implementation_defect | negative_sample
+
+    @classmethod
+    def from_outcome(
+        cls,
+        contract: Optional[PredictionContract],
+        outcome: SubStepOutcome,
+        parent_task_success: bool = False,
+    ) -> PredictionVerification:
+        """Factory: compare prediction contract against actual step outcome.
+
+        Quality labels (ExperienceOS.md §5.1.2):
+
+        - prediction OK + step OK → ``"high_quality"`` (weight ×1.0)
+        - prediction BAD + step OK → ``"lucky_success"`` (weight ×0.3)
+        - prediction OK + step FAIL → ``"implementation_defect"`` (→ F2)
+        - prediction BAD + step FAIL → ``"negative_sample"`` (boundary record)
+
+        When the step fails, we distinguish infrastructure errors (timeout,
+        connection, rate-limit — agent's plan was correct) from domain errors
+        (not found, invalid input — agent's prediction was wrong about what
+        the system would return).
+        """
+        prediction_accurate = False
+        divergence_reason = ""
+
+        # Infrastructure error markers — agent's prediction was likely correct
+        # but the system failed to execute.
+        _infra_errors = {
+            "timeout", "connection", "rate limit", "unauthorized",
+            "server error", "internal error", "unavailable",
+            "try again", "capacity", "overloaded",
+        }
+
+        if contract is not None:
+            # Check prediction accuracy regardless of step success/failure
+            expected_keywords = _extract_keywords(contract.expected_output)
+            actual_lower = (outcome.error or "").lower()
+            result_text = str(outcome.params.get("_result_summary", actual_lower))
+
+            if not outcome.success and any(
+                ie in actual_lower for ie in _infra_errors
+            ):
+                # Infrastructure failure → agent's prediction was correct,
+                # the system just couldn't execute.
+                prediction_accurate = True
+                divergence_reason = f"Infrastructure failure: {outcome.error}"
+            elif expected_keywords:
+                match_count = sum(
+                    1 for kw in expected_keywords if kw.lower() in result_text
+                )
+                prediction_accurate = match_count >= len(expected_keywords) * 0.5
+                if not prediction_accurate:
+                    divergence_reason = (
+                        f"Expected keywords {expected_keywords} not found in result"
+                    )
+            elif outcome.success:
+                # No explicit expected output + step succeeded → assume accurate
+                prediction_accurate = True
+            else:
+                # No expected output + step failed → can't verify, default accurate
+                prediction_accurate = True
+
+            if prediction_accurate and not outcome.success and not divergence_reason:
+                divergence_reason = outcome.error or "step failed"
+
+        # Quality label
+        if prediction_accurate and outcome.success:
+            quality_label = "high_quality"
+        elif not prediction_accurate and outcome.success:
+            quality_label = "lucky_success"
+        elif prediction_accurate and not outcome.success:
+            quality_label = "implementation_defect"
+        else:
+            quality_label = "negative_sample"
+
+        return cls(
+            contract=contract,
+            actual_output=(outcome.error or "")[:500],
+            actual_effect="",
+            prediction_accurate=prediction_accurate,
+            divergence_reason=divergence_reason,
+            quality_label=quality_label,
+        )
+
+
+def _extract_keywords(text: str) -> list[str]:
+    """Extract meaningful keywords from a prediction text for heuristic matching."""
+    if not text:
+        return []
+    # Split on common delimiters, filter noise words
+    noise = {"the", "a", "an", "is", "are", "be", "to", "of", "in", "for",
+             "on", "with", "and", "or", "will", "should", "would", "could",
+             "this", "that", "it", "its", "i", "we", "you", "they"}
+    words = text.replace(",", " ").replace(".", " ").replace(":", " ").split()
+    return [w for w in words if len(w) > 2 and w.lower() not in noise][:6]
 
 
 # =====================================================================

@@ -19,16 +19,16 @@ import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from experience_os.services import EmbeddingService
     from experience_os.models import SubStepPattern
 
-from experience_os.llm import LLMClient  # backward compat
 from experience_os.models import EnvironmentSnapshot, Harness
 from experience_os.repository import Repository
+from experience_os.services import Services
 
 log = logging.getLogger(__name__)
 
@@ -48,12 +48,7 @@ class RetrievalResult:
 
 
 class RuntimeRouter:
-    """Selects a harness for a given task, or signals agent fallback.
-
-    支持两种初始化方式：
-    - 新方式：``RuntimeRouter(repo, services=svc)`` — 用 ``Services`` 依赖注入
-    - 旧方式：``RuntimeRouter(repo, llm=client)`` — 向后兼容
-    """
+    """Selects a harness for a given task, or signals agent fallback."""
 
     SOFT_KEYS = {"version", "browser", "screen_resolution", "latency"}
 
@@ -62,30 +57,11 @@ class RuntimeRouter:
     LOW_CONF_THRESHOLD = 0.65    # cosine < 此值 → 直接回退 ReAct，不浪费 LLM
 
     def __init__(
-        self, repo: Repository,
-        llm: Optional[LLMClient] = None,
-        services: Optional[Any] = None,
-        top_k: int = 5,
+        self, repo: Repository, services: Services, top_k: int = 5,
     ) -> None:
         self.repo = repo
-        self._llm = llm
         self._services = services
         self.top_k = top_k
-
-    @property
-    def llm(self) -> LLMClient:
-        """向后兼容：返回 LLMClient（老代码路径）。"""
-        if self._llm is not None:
-            return self._llm
-        if self._services is not None:
-            return self._services.llm._client  # type: ignore[union-attr]
-        raise RuntimeError("RuntimeRouter: neither llm nor services provided")
-
-    @property
-    def embed(self) -> "EmbeddingService":
-        if self._services is not None:
-            return self._services.embed
-        raise RuntimeError("RuntimeRouter: services not provided for embedding")
 
     # ------------------------------------------------------------------
     # embedding cache
@@ -93,7 +69,9 @@ class RuntimeRouter:
     def _ensure_embedding(self, harness: Harness) -> list[float]:
         if harness.embedding is not None:
             return harness.embedding
-        vec = self.llm.embed(harness.retrieval_text())
+        if self._services is None:
+            raise RuntimeError("RuntimeRouter: services required for embedding retrieval")
+        vec = self._services.embedding.embed(harness.retrieval_text())
         harness.embedding = vec
         self.repo.add_harness(harness)  # persist
         return vec
@@ -111,7 +89,9 @@ class RuntimeRouter:
     # stage 1 — semantic retrieval
     # ------------------------------------------------------------------
     def _semantic_search(self, task_description: str) -> list[tuple[Harness, float]]:
-        query_vec = self.llm.embed(task_description)
+        if self._services is None:
+            raise RuntimeError("RuntimeRouter: services required for embedding retrieval")
+        query_vec = self._services.embedding.embed(task_description)
         scored: list[tuple[Harness, float]] = []
         for h in self.repo.active_harnesses():
             vec = self._ensure_embedding(h)
@@ -216,7 +196,7 @@ class RuntimeRouter:
 
         # Layer 2a/2b/2c: embedding matching
         try:
-            high, fuzzy, rejected = self.embed.match_intent(
+            high, fuzzy, rejected = self._services.embedding.match_intent(
                 intent, patterns,
                 high_threshold=self.HIGH_CONF_THRESHOLD,
                 low_threshold=self.LOW_CONF_THRESHOLD,
@@ -229,7 +209,7 @@ class RuntimeRouter:
         # Layer 2a: high confidence → use directly
         if high:
             best_pattern, sim = high[0]
-            # Also check input/output signature compatibility
+            # Also check input/output signature constraints
             if self._check_io_signature(best_pattern, available_inputs, needed_outputs):
                 h = self.repo.get_harness_for_capability(best_pattern.intent)
                 if h:

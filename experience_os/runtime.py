@@ -24,7 +24,6 @@ from experience_os.compiler import HarnessInductor
 from experience_os.config import Config
 from experience_os.environment import BaseEnvironment, TaskRequest
 from experience_os.harness_registry import HarnessRegistry
-from experience_os.llm import LLMClient
 from experience_os.models import (
     ExecutionResult,
     FailureType,
@@ -35,6 +34,9 @@ from experience_os.models import (
 )
 from experience_os.repository import Repository
 from experience_os.retriever import RuntimeRouter
+from experience_os.experience_library import ExperienceLibrary
+from experience_os.services import Services
+from experience_os.stores import ArtifactStore, ExperienceStore, TraceStore, stores_for
 
 log = logging.getLogger(__name__)
 
@@ -51,8 +53,6 @@ class Runtime:
     ----------
     config:
         :class:`~experience_os.config.Config` with LLM + induction settings.
-    llm:
-        :class:`~experience_os.llm.LLMClient` instance (or ``None`` to create one).
     env:
         :class:`~experience_os.environment.BaseEnvironment` subclass instance.
     """
@@ -61,18 +61,38 @@ class Runtime:
         self,
         config: Config,
         env: BaseEnvironment,
-        llm: Optional[LLMClient] = None,
+        *,
+        services: Optional[Services] = None,
+        library: Optional[ExperienceLibrary] = None,
     ) -> None:
         self.config = config
         self.env = env
-        self.llm = llm or LLMClient(config.llm)
         self.repo = Repository(config)
-        self.router = RuntimeRouter(self.repo, self.llm)
-        self.agent = AgentFallback(self.llm)
-        self.inductor = HarnessInductor(self.config, self.llm, self.repo)
+        self.services = services or Services.from_config(config, self.repo.storage)
+        self._library = library or ExperienceLibrary(config.data_dir / "experience_library.db")
+        self._owns_library = library is None
+        self.trace_store, self.experience_store, self.artifact_store = stores_for(self._library)
+        self.router = RuntimeRouter(self.repo, self.services)
+        self.agent = AgentFallback(self.services.chat)
+        self.inductor = HarnessInductor(
+            self.config, self.services, self.repo,
+            experience_store=self.experience_store,
+        )
         self.registry = HarnessRegistry(self.repo)
         self.mode: SystemMode = SystemMode.ACCUMULATION
         self.phase: str = ""  # "warmup" | "eval" | "" — 由实验框架设置
+
+    def close(self) -> None:
+        """Close resources owned by the runtime."""
+        self.repo.storage.close()
+        if self._owns_library:
+            self._library.close()
+
+    def __enter__(self) -> "Runtime":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     # ==================================================================
     # public API

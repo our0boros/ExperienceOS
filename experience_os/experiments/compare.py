@@ -28,6 +28,7 @@ from experience_os.experience_library import (
     TrajectoryRecord,
     serialize_messages,
 )
+from experience_os.stores import TraceStore, stores_for
 from experience_os.tau2_adapter import infer_task_type
 
 log = logging.getLogger(__name__)
@@ -366,13 +367,14 @@ def _inject_skill(agent, skill_content: str) -> None:
 def run_coe(group, domain, model, warmup, eval_size, max_steps, solo_mode,
                     *, skip_validation=False, no_versioning=False,
                     warmup_tasks=None, eval_tasks=None,
-                    experiment_id: str = "") -> list[TaskResult]:
+                    experiment_id: str = "", trace_store: Optional[TraceStore] = None,
+                    library: Optional[ExperienceLibrary] = None) -> list[TaskResult]:
     from experience_os.config import Config
     from experience_os.environment import MockEnvironment
     from experience_os.runtime import Runtime, SystemMode
     from experience_os.tau2_adapter import (
         Tau2Environment, _extract_task_description,
-        convert_simulation, extract_task_params, run_tau2_simulation,
+        convert_simulation, run_tau2_simulation,
     )
 
     cfg = Config()
@@ -388,12 +390,16 @@ def run_coe(group, domain, model, warmup, eval_size, max_steps, solo_mode,
     cfg.ensure_dirs()
     if skip_validation:
         cfg.induction.validation_threshold = 0.0
-    rt = Runtime(cfg, MockEnvironment())
+    rt = Runtime(cfg, MockEnvironment(), library=library)
+    trace_store = trace_store or rt.trace_store
     tau2_model, api_base = _resolve_tau2_model(model)
     sequential = _is_deepinfra(model)
 
     warmup_tasks = warmup_tasks if warmup_tasks is not None else group[:warmup]
     eval_tasks = eval_tasks if eval_tasks is not None else group[warmup: warmup + eval_size]
+    from experience_os.input_resolver import ArtifactInputResolver
+
+    input_resolver = ArtifactInputResolver()
     results: list[TaskResult] = []
     warmup_results: list[TaskResult] = []  # 收集用于子步骤提取
     idx = 1
@@ -443,7 +449,8 @@ def run_coe(group, domain, model, warmup, eval_size, max_steps, solo_mode,
         # ── 在线检测：每个成功任务后，提取 tool calls 写入 substeps → 检查触发 ──
         if reward >= 1.0 and messages_json:
             try:
-                _log_tool_calls_as_substeps(wr, experiment_id)
+                _log_tool_calls_as_substeps(wr, experiment_id, trace_store,
+                                            source_method="coe")
             except Exception:
                 pass
 
@@ -463,9 +470,9 @@ def run_coe(group, domain, model, warmup, eval_size, max_steps, solo_mode,
     # 从 warmup 轨迹的 messages_json 中直接提取 tool calls 写入 substeps 表
     print(f"  [substep] extracting from {len(warmup_results)} warmup results...")
     try:
-        from experience_os.experience_library import ExperienceLibrary, SubStepRecord
+        from experience_os.experience_library import SubStepRecord
         import json as _json
-        lts_lib = ExperienceLibrary.persistent()
+        substep_store = trace_store or rt.trace_store
         n_sub = 0
         for r in warmup_results:
             if not r.messages_json:
@@ -505,7 +512,7 @@ def run_coe(group, domain, model, warmup, eval_size, max_steps, solo_mode,
                         parent_task_type=r.task_type,
                         parent_task_success=r.success,
                     )
-                    lts_lib.log_substep(rec)
+                    substep_store.append_substep(rec)
                     plan_idx += 1
                     n_sub += 1
         if n_sub:
@@ -545,7 +552,7 @@ def run_coe(group, domain, model, warmup, eval_size, max_steps, solo_mode,
     for i, task in enumerate(eval_tasks, 1):
         tt = infer_task_type(task)
         desc = _extract_task_description(task)
-        params = extract_task_params(task)
+        params = input_resolver.resolve(task, []).params
         t0 = time.time()
         used_harness = False
         path = "agent"
@@ -604,7 +611,8 @@ def run_coe(group, domain, model, warmup, eval_size, max_steps, solo_mode,
         _last = results[-1]
         if _last.path != "harness" and _last.messages_json and _last.success:
             try:
-                _log_tool_calls_as_substeps(_last, experiment_id)
+                _log_tool_calls_as_substeps(_last, experiment_id, trace_store,
+                                            source_method="coe")
             except Exception:
                 pass
 
@@ -612,6 +620,174 @@ def run_coe(group, domain, model, warmup, eval_size, max_steps, solo_mode,
         if sequential and i < len(eval_tasks):
             time.sleep(3)
 
+    rt.close()
+    return results
+
+
+# ======================================================================
+# 方法：coe online（在线积累模式）
+# ======================================================================
+def run_coe_online(
+    tasks: list,
+    domain: str,
+    model: str,
+    max_steps: int = 30,
+    solo_mode: bool = False,
+    *,
+    experiment_id: str = "",
+    trace_store: Optional[TraceStore] = None,
+    library: Optional[ExperienceLibrary] = None,
+) -> list[TaskResult]:
+    """CoE 在线积累模式：边执行边归纳，新 harness 立即可用。
+
+    与传统的 warmup→批量归纳→eval 不同，此模式将所有任务放在
+    一个顺序流中。每完成一个任务：
+      1. 尝试已归纳的 harness（如有匹配）
+      2. 若 harness 命中 → 直接执行（绕过 LLM）
+      3. 若 harness 失败/无匹配 → agent 执行
+      4. 提取 substeps → 检查触发条件 → 立即归纳
+      5. 新 harness 加入活跃集合 → 下一个任务可用
+
+    这是 ExperienceOS 的核心创新验证模式：**不依赖预积累**，
+    从零开始，通过在线学习逐步提升性能。
+    """
+    from experience_os.config import Config
+    from experience_os.environment import MockEnvironment
+    from experience_os.runtime import Runtime, SystemMode
+    from experience_os.tau2_adapter import (
+        Tau2Environment,
+        _extract_task_description,
+        convert_simulation,
+        infer_task_type,
+        run_tau2_simulation,
+    )
+    from experience_os.input_resolver import ArtifactInputResolver
+
+    cfg = Config()
+    # 配置归纳用 LLM 后端
+    if model.startswith("deepinfra/"):
+        cfg.llm.backend = "deepinfra"
+        cfg.llm.deepinfra_model = model.split("/", 1)[-1]
+    elif model.startswith("ollama/"):
+        cfg.llm.backend = "ollama"
+        cfg.llm.ollama_model = model.split("/", 1)[-1]
+    cfg.ensure_dirs()
+
+    rt = Runtime(cfg, MockEnvironment(), library=library)
+    trace_store = trace_store or rt.trace_store
+    tau2_model, api_base = _resolve_tau2_model(model)
+    sequential = _is_deepinfra(model)
+    input_resolver = ArtifactInputResolver()
+    results: list[TaskResult] = []
+
+    def _build_env(t):
+        """为指定任务构建独立 Tau2Environment。"""
+        return Tau2Environment(domain, t, solo_mode=solo_mode)
+
+    rt.set_mode(SystemMode.DEPLOYMENT)  # 在线模式：有 harness 就用，没有就走 agent
+    rt.set_phase("online")
+
+    # 清理旧实验的 ACTIVE harness，确保在线模式从零开始
+    # P1.1 去重会阻止对已有 harness 的 pattern 重新归纳
+    for h in list(rt.repo.active_harnesses()):
+        rt.repo.deprecate(h.id)
+
+    # 初始化 HarnessRegistry（后续 agent 工具调用会被拦截执行 harness）
+    rt.registry.load_all()
+
+    print(f"  [online] 开始在线积累: {len(tasks)} 个任务, min_support={cfg.induction.min_support}")
+
+    for i, task in enumerate(tasks, 1):
+        tt = infer_task_type(task)
+        desc = _extract_task_description(task)
+        params = input_resolver.resolve(task, []).params
+        t0 = time.time()
+        used_harness = False
+        path = "agent"
+
+        # ── Agent 执行（registry 拦截工具调用，命中则走 harness）──
+        try:
+            sim = run_tau2_simulation(
+                domain=domain, task=task, llm_model=tau2_model,
+                llm_api_base=api_base, max_steps=max_steps,
+                seed=42 + i, solo_mode=solo_mode,
+                harness_registry=rt.registry,
+            )
+            traj = convert_simulation(sim, task, tt)
+            rt.repo.add_trajectory(traj)
+            reward = sim.reward_info.reward if sim.reward_info else 0.0
+            msgs = sim.get_messages() if hasattr(sim, "get_messages") else (sim.messages or [])
+            messages_json = serialize_messages(msgs)
+            pt, ct, tt_tok = _extract_token_usage(messages_json)
+            intercepts = getattr(sim, '_harness_intercept_count', 0)
+            path = f"harness+agent({intercepts})" if intercepts > 0 else "agent"
+        except Exception as exc:
+            results.append(TaskResult(
+                idx=i, phase="online", task_id=task.id, task_type=tt,
+                method="coe", success=False, reward=0.0, tokens=0,
+                latency=time.time() - t0, path=path, error=str(exc)[:200],
+            ))
+            if sequential:
+                time.sleep(3)
+            continue
+
+        tr = TaskResult(
+            idx=i, phase="online", task_id=task.id, task_type=tt,
+            method="coe", success=reward >= 1.0, reward=reward,
+            tokens=tt_tok, prompt_tokens=pt, completion_tokens=ct,
+            latency=time.time() - t0, path=path,
+            messages_json=messages_json,
+        )
+        results.append(tr)
+
+        # ── Step 3: 提取 substeps ──
+        if reward >= 1.0 and messages_json:
+            try:
+                _log_tool_calls_as_substeps(tr, experiment_id, trace_store,
+                                            source_method="coe")
+            except Exception:
+                pass
+
+        # ── Step 4: 检查触发条件 + 在线归纳 ──
+        rt.inductor._current_experiment_id = experiment_id
+        for check_tt in rt.repo.all_task_types():
+            triggers = rt.inductor.check_triggers(check_tt)
+            if not triggers:
+                continue
+            same = [t for t in tasks[:i] if infer_task_type(t) == check_tt]
+            if not same:
+                continue
+            for trigger, pattern in triggers:
+                try:
+                    tenv = Tau2Environment(domain, same[0], solo_mode=solo_mode)
+                    h = rt.inductor.induce(
+                        check_tt, tenv, trigger,
+                        substep_pattern=pattern,
+                        env_builder=lambda traj, t=same[0]: Tau2Environment(
+                            domain, t, solo_mode=solo_mode,
+                        ),
+                    )
+                    # 从 repo 重载 registry（无论 induce 返回什么格式）
+                    before = rt.registry.count
+                    rt.registry.load_all()
+                    new_count = rt.registry.count - before
+                    if new_count > 0:
+                        print(f"  [online] #{i} induced {new_count} harness(es) "
+                              f"(total={rt.registry.count})")
+                except Exception as exc:
+                    log.debug("online induce %s failed: %s", check_tt, exc)
+
+        tag = "[OK]" if reward >= 1.0 else "[X]"
+        print(f"  [{i}/{len(tasks)}] {task.id} {tag} path={path} "
+              f"tokens={tt_tok} harnesses={rt.registry.count}")
+
+        if sequential and i < len(tasks):
+            time.sleep(3)
+
+    rt.close()
+    print(f"  [online] 完成: {len(tasks)} 任务, "
+          f"归纳 {rt.registry.count} 个 harness, "
+          f"SR={sum(1 for r in results if r.success)}/{len(tasks)}")
     return results
 
 
@@ -701,6 +877,8 @@ def run_experiment(
     # LTS 持久库 + 实验库
     lts = ExperienceLibrary.persistent()
     exp_lib = ExperienceLibrary.experiment(eid)
+    lts_trace_store, _, _ = stores_for(lts)
+    exp_trace_store, _, _ = stores_for(exp_lib)
 
     # 加载 skill（skillopt 方法）
     skill_text = ""
@@ -719,7 +897,7 @@ def run_experiment(
             group, domain, model, warmup, eval_size, max_steps, solo_mode,
             skip_validation=skip_validation, no_versioning=no_versioning,
             warmup_tasks=warmup_tasks, eval_tasks=eval_tasks,
-            experiment_id=eid,
+            experiment_id=eid, trace_store=lts_trace_store, library=lts,
         )
     else:
         for i, task in enumerate(stream, 1):
@@ -736,22 +914,13 @@ def run_experiment(
             results.append(r)
             # 写入 LTS + 实验库（完整轨迹）
             rec = _to_trajectory_record(r, eid, domain, task, model, variant)
-            lts.log_trajectory(rec)
-            exp_lib.log_trajectory(rec)
+            lts_trace_store.append(rec)
+            exp_trace_store.append(rec)
             tag = "[OK]" if r.success else "[X]"
             print(f"  [{i}/{len(stream)}] {phase} {r.task_id} {tag} "
                   f"reward={r.reward:.2f} tokens={r.tokens} {r.error[:40]}")
             if inter_task_delay and i < len(stream):
                 time.sleep(inter_task_delay)
-
-    # coe 也写入 LTS + 实验库
-    if method == "coe":
-        warmup_n = len(warmup_tasks)
-        for r in results:
-            task = (warmup_tasks + eval_tasks)[r.idx - 1] if r.idx <= len(stream) else None
-            rec = _to_trajectory_record(r, eid, domain, task, model, variant)
-            lts.log_trajectory(rec)
-            exp_lib.log_trajectory(rec)
 
     exp = ExperimentResult(
         method=method, model=model, domain=domain, task_type=chosen_type,
@@ -767,10 +936,118 @@ def run_experiment(
     return exp
 
 
-def _log_tool_calls_as_substeps(r: TaskResult, experiment_id: str) -> int:
-    """从 TaskResult 的 messages_json 中提取 tool calls，写入 substeps 表。"""
+def _extract_prediction_accuracy(
+    messages: list[dict],
+) -> list[dict[str, Any]]:
+    """从对话消息中提取每个工具调用的预测准确性。
+
+    对每条 assistant 消息（含 tool_calls），将其 reasoning（content 文本）
+    作为隐式"预测契约"，与随后的 tool 消息（实际结果）对比。
+
+    Returns:
+        list of dicts with keys: tool_name, prediction_accuracy, quality_label,
+        expected_keywords, result_summary.
+
+    参考：docs/ExperienceOS.md §5.1.2 预测质量分层。
+    """
+    from experience_os.models import _extract_keywords
+
+    results: list[dict[str, Any]] = []
+
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        tcs = msg.get("tool_calls", [])
+        if not isinstance(tcs, list) or not tcs:
+            continue
+
+        # Assistant reasoning = implicit prediction
+        reasoning = msg.get("content", "") or ""
+
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function", tc)
+            tool_name = fn.get("name", "")
+            if not tool_name:
+                continue
+
+            # Extract expected output keywords from reasoning
+            expected_keywords = _extract_keywords(reasoning)
+
+            # Find the matching tool result (next tool message for this call_id)
+            call_id = tc.get("id", "")
+            result_text = ""
+            result_success = True
+
+            for j in range(i + 1, min(i + 5, len(messages))):
+                nxt = messages[j]
+                if not isinstance(nxt, dict):
+                    continue
+                if nxt.get("role") == "tool" and nxt.get("tool_call_id") == call_id:
+                    result_text = str(nxt.get("content", "") or "")
+                    break
+                # If next assistant message encountered before tool result,
+                # the tool call was likely aborted or the result was empty
+                if nxt.get("role") == "assistant":
+                    break
+
+            # Heuristic: check for error indicators in result
+            error_markers = ["error", "Error", "failed", "not found", "invalid",
+                            "denied", "unavailable", "cannot", "could not",
+                            "does not exist", "no such"]
+            has_error = any(m in result_text for m in error_markers)
+
+            if has_error:
+                result_success = False
+
+            # Compute prediction accuracy
+            if not result_text:
+                # No result found → assume accurate (tool call was made)
+                prediction_accurate = True
+                quality_label = "high_quality" if result_success else "implementation_defect"
+            elif has_error:
+                # Result contains error → agent predicted success but got error
+                prediction_accurate = False if reasoning else True
+                quality_label = "implementation_defect"
+            elif expected_keywords:
+                # Check if expected keywords appear in result
+                match_count = sum(
+                    1 for kw in expected_keywords
+                    if kw.lower() in result_text.lower()
+                )
+                prediction_accurate = match_count >= max(1, len(expected_keywords) * 0.3)
+                quality_label = "high_quality" if prediction_accurate else "lucky_success"
+            else:
+                # No explicit expectations → assume accurate
+                prediction_accurate = True
+                quality_label = "high_quality"
+
+            results.append({
+                "tool_name": tool_name,
+                "prediction_accuracy": 1.0 if prediction_accurate else 0.0,
+                "quality_label": quality_label,
+                "expected_keywords": expected_keywords,
+                "result_summary": result_text[:300] if result_text else "(no result)",
+            })
+
+    return results
+
+
+def _log_tool_calls_as_substeps(
+    r: TaskResult, experiment_id: str, trace_store: TraceStore,
+    *,
+    source_method: str = "",
+) -> int:
+    """从 TaskResult 的 messages_json 中提取 tool calls，写入 substeps 表。
+
+    Phase A（预测契约）：对每条 tool call 提取 agent reasoning 作为隐式预测，
+    与 tool result 对比，记录 prediction_accuracy 和 quality_label。
+    """
     import json as _json
-    from experience_os.experience_library import ExperienceLibrary, SubStepRecord
+    from experience_os.experience_library import SubStepRecord
 
     if not r.messages_json:
         return 0
@@ -781,7 +1058,17 @@ def _log_tool_calls_as_substeps(r: TaskResult, experiment_id: str) -> int:
     if not isinstance(msgs, list):
         return 0
 
-    lts = ExperienceLibrary.persistent()
+    # Phase A: 提取预测契约验证结果
+    predictions = _extract_prediction_accuracy(msgs)
+    pred_by_tool: dict[str, dict] = {}
+    for p in predictions:
+        tn = p["tool_name"]
+        if tn not in pred_by_tool:
+            pred_by_tool[tn] = p
+        else:
+            # 同一工具多次调用，保留最后一条
+            pred_by_tool[tn] = p
+
     n = 0
     plan_idx = 0
     for msg in msgs:
@@ -803,6 +1090,12 @@ def _log_tool_calls_as_substeps(r: TaskResult, experiment_id: str) -> int:
                     args = _json.loads(args)
                 except Exception:
                     args = {"raw": args}
+
+            # Phase A: 查找预测验证结果
+            pred_info = pred_by_tool.pop(tool_name, {})
+            pred_acc = pred_info.get("prediction_accuracy", 1.0)
+            qual_label = pred_info.get("quality_label", "")
+
             rec = SubStepRecord(
                 trajectory_id=r.task_id,
                 experiment_id=experiment_id,
@@ -812,11 +1105,13 @@ def _log_tool_calls_as_substeps(r: TaskResult, experiment_id: str) -> int:
                 params_json=_json.dumps(args, ensure_ascii=False),
                 success=True,
                 execution_mode="agent",
-                source="react",
+                source=source_method or getattr(r, "method", "unknown"),
                 parent_task_type=r.task_type,
                 parent_task_success=r.success,
+                prediction_accuracy=pred_acc,
+                quality_label=qual_label,
             )
-            lts.log_substep(rec)
+            trace_store.append_substep(rec)
             plan_idx += 1
             n += 1
     return n

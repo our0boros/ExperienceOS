@@ -60,7 +60,7 @@ def run_demo(config: Config) -> None:
 
     # ---- ping ----
     print("\n[0] Pinging LLM backend...")
-    if not rt.llm.ping():
+    if not rt.services.chat.ping():
         print("[X] LLM unreachable. Check EOS_LLM_BACKEND / ollama running.")
         print("  (try: ollama serve)")
         return

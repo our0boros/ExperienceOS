@@ -1,6 +1,13 @@
-"""层级化经验库（SQLite）。
+"""SQLite implementation shared by the Trace, Experience, and Artifact stores.
 
-三层结构（对应 STRUCTURE.md §5）：
+.. deprecated::
+    新代码应通过 ``stores.py`` 的 Store facade 访问：
+    ``stores_for(library)`` → (TraceStore, ExperienceStore, ArtifactStore)。
+    直接调用 ``ExperienceLibrary`` 的方法仅保留向后兼容。
+
+原始轨迹 append-only，历史 SQLite 数据和迁移能力必须保留。
+
+三层结构：
 
     底层 trajectories  — 完整轨迹：任务内容、完整对话（LLM 看到的 prompt
                           和回复）、tool calls/results、reward、tokens。
@@ -213,6 +220,10 @@ class SubStepRecord:
     intent_embedding: Optional[bytes] = None
     embedding_model: str = ""
     logged_at: float = 0.0
+    # 预测契约（Phase A，来自 flow.md 融合）
+    # 存储于 meta_json 中以避免 schema 变更；此处为便利访问字段
+    prediction_accuracy: float = 1.0   # 0.0–1.0，默认 1.0（未启用预测契约时）
+    quality_label: str = ""             # high_quality | lucky_success | implementation_defect | negative_sample
 
 
 def serialize_messages(messages: list[Any]) -> str:
@@ -351,6 +362,19 @@ class ExperienceLibrary:
         intent_blob: Optional[bytes] = None
         if rec.intent_embedding is not None:
             intent_blob = rec.intent_embedding
+
+        # 预测契约字段编码到 meta_json（Phase A，无 schema 变更）
+        meta: dict[str, Any] = {}
+        if rec.meta_json:
+            try:
+                meta = json.loads(rec.meta_json)
+            except Exception:
+                meta = {"raw": rec.meta_json}
+        if rec.prediction_accuracy != 1.0 or rec.quality_label:
+            meta["prediction_accuracy"] = rec.prediction_accuracy
+            meta["quality_label"] = rec.quality_label
+        meta_json = json.dumps(meta, ensure_ascii=False) if meta else rec.meta_json
+
         c = self.conn.execute(
             """INSERT INTO substeps
                (trajectory_id, experiment_id, plan_idx, intent, tool_name,
@@ -367,7 +391,7 @@ class ExperienceLibrary:
                 rec.params_json, rec.result_json,
                 int(rec.success), rec.execution_mode, rec.tokens_used,
                 rec.artifact_id, rec.artifact_version,
-                rec.failure_type, rec.source, rec.meta_json,
+                rec.failure_type, rec.source, meta_json,
                 rec.parent_task_type, int(rec.parent_task_success),
                 intent_blob, rec.embedding_model, time.time(),
             ),
@@ -401,7 +425,7 @@ class ExperienceLibrary:
     def aggregate_substep_patterns(
         self, *, experiment_id: str = "", min_support: int = 0,
     ) -> list[dict]:
-        """从 substeps 表聚合子步骤模式（贝叶斯权重）。
+        """从 substeps 表聚合子步骤模式（贝叶斯权重 + 预测契约调整）。
 
         返回每个 ``(intent, tool_name)`` 组合的统计：
         - support_count: 去重轨迹数
@@ -409,6 +433,9 @@ class ExperienceLibrary:
         - success_in_full_tasks: 在成功全任务中的出现次数
         - total_appearances: 在任何全任务中的出现次数
         - bayesian_score: 贝叶斯可信度（α=1, β=1）
+        - adjusted_bayesian: 经预测准确率调整后的评分（Phase A）
+        - prediction_accuracy: 平均预测准确率
+        - quality_label_dist: 质量标签分布
         """
         sql = """SELECT
             intent, tool_name, effect,
@@ -429,21 +456,77 @@ class ExperienceLibrary:
         params.append(min_support if min_support > 0 else 1)
 
         rows = self.conn.execute(sql, params).fetchall()
-        col_names = [d[0] for d in self.conn.execute(
-            "SELECT intent, tool_name, effect, 0 as support_count, 0 as success_count, "
-            "0 as success_in_full_tasks, 0 as total_appearances, 0 as total_trajectories "
-            "FROM substeps LIMIT 0").description]
+
+        # Phase A: 为每个分组额外查询 meta_json 中的预测数据
+        pred_sql = """SELECT meta_json, success, parent_task_success
+                      FROM substeps WHERE intent=? AND tool_name=?"""
+        if experiment_id:
+            pred_sql += " AND experiment_id=?"
+        pred_params_base: list = []
+        if experiment_id:
+            pred_params_base.append(experiment_id)
 
         results = []
         for row in rows:
-            d = dict(zip(col_names, row))
-            sc = d["success_count"] or 0
-            ta = d["total_appearances"] or 0
-            sft = d["success_in_full_tasks"] or 0
-            d["success_rate"] = sc / ta if ta > 0 else 0.0
-            # Bayesian score: Beta-Binomial with α=1, β=1
-            alpha, beta = 1.0, 1.0
-            d["bayesian_score"] = (alpha + sft) / (alpha + beta + ta) if (alpha + beta + ta) > 0 else 0.0
+            intent = row[0] if isinstance(row, tuple) else row.get("intent", "")
+            tool_name = row[1] if isinstance(row, tuple) else row.get("tool_name", "")
+            effect = row[2] if isinstance(row, tuple) else row.get("effect", "")
+            sc = (row[3] if isinstance(row, tuple) else row.get("support_count", 0)) or 0
+            succ = (row[4] if isinstance(row, tuple) else row.get("success_count", 0)) or 0
+            sft = (row[5] if isinstance(row, tuple) else row.get("success_in_full_tasks", 0)) or 0
+            ta = (row[6] if isinstance(row, tuple) else row.get("total_appearances", 0)) or 0
+
+            success_rate = succ / ta if ta > 0 else 0.0
+            alpha, beta_val = 1.0, 1.0
+            bayesian_score = (alpha + sft) / (alpha + beta_val + ta) if (alpha + beta_val + ta) > 0 else 0.0
+
+            # Phase A: 收集预测准确率
+            pred_params = [intent, tool_name] + pred_params_base
+            meta_rows = self.conn.execute(pred_sql, pred_params).fetchall()
+            pred_accs = []
+            qual_labels = []
+            for (meta_json, _, _) in meta_rows:
+                pred_acc = 1.0
+                qual = ""
+                if meta_json:
+                    try:
+                        meta = json.loads(meta_json)
+                        if isinstance(meta, dict):
+                            pred_acc = float(meta.get("prediction_accuracy", 1.0))
+                            qual = meta.get("quality_label", "")
+                    except Exception:
+                        pass
+                pred_accs.append(pred_acc)
+                if qual:
+                    qual_labels.append(qual)
+
+            avg_pred_acc = sum(pred_accs) / len(pred_accs) if pred_accs else 1.0
+            pred_multiplier = 0.5 + 0.5 * avg_pred_acc
+            adjusted_bayesian = bayesian_score * pred_multiplier
+
+            # 侥幸成功惩罚
+            from collections import Counter
+            label_counts = Counter(qual_labels)
+            lucky_ratio = label_counts.get("lucky_success", 0) / max(1, len(pred_accs))
+            if lucky_ratio > 0.3:
+                adjusted_bayesian *= 0.7
+
+            d = {
+                "intent": intent,
+                "tool_name": tool_name,
+                "action_name": tool_name,
+                "effect": effect or "read_only",
+                "support_count": sc,
+                "success_count": succ,
+                "success_rate": success_rate,
+                "success_in_full_tasks": sft,
+                "total_appearances": ta,
+                "bayesian_score": bayesian_score,
+                "adjusted_bayesian": adjusted_bayesian,
+                "score": adjusted_bayesian,
+                "prediction_accuracy": avg_pred_acc,
+                "quality_label_dist": dict(label_counts),
+            }
             results.append(d)
 
         return results
@@ -564,7 +647,7 @@ class ExperienceLibrary:
                (created_at, experiment_id, task_type, artifact_type, name,
                 procedure_code, skill_text, verification_status, validation_score,
                 embedding_blob, parent_seq, edge_type, version, meta_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 time.time(), experiment_id, task_type, artifact_type, name,
                 procedure_code, skill_text, verification_status, validation_score,

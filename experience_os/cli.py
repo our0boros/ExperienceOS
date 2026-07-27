@@ -214,9 +214,13 @@ def main(argv: list[str] | None = None) -> int:
 # commands
 # ======================================================================
 def _cmd_ping(config: Config) -> int:
-    from experience_os.llm import LLMClient
+    from experience_os.services import Services
+    from experience_os.storage import Storage
 
-    client = LLMClient(config.llm)
+    storage = Storage(config)
+    services = Services.from_config(config, storage)
+    client = services.chat
+    embedding = services.embedding
     print(f"Backend: {config.llm.backend}")
     print(f"Model:   {config.llm.model}")
     print(f"Base URL: {config.llm.base_url}")
@@ -224,7 +228,7 @@ def _cmd_ping(config: Config) -> int:
         print("[OK] LLM backend reachable")
         # also test embeddings
         try:
-            vec = client.embed("hello")
+            vec = embedding.embed("hello")
             print(f"[OK] Embeddings OK (dim={len(vec)})")
         except Exception as exc:
             print(f"[X] Embeddings failed: {exc}")

@@ -30,7 +30,6 @@ from typing import Callable, Optional
 
 from experience_os.config import Config
 from experience_os.environment import BaseEnvironment, TaskRequest
-from experience_os.llm import LLMClient
 from experience_os.models import (
     ArtifactType,
     ExperienceRecord,
@@ -46,6 +45,8 @@ from experience_os.models import (
     Trajectory,
 )
 from experience_os.repository import Repository
+from experience_os.services import Services
+from experience_os.stores import ExperienceStore
 from experience_os.compiler import algorithms as algo
 from experience_os.compiler.prompts import (
     JUDGE_PROMPT,
@@ -76,14 +77,26 @@ class HarnessInductor:
     def __init__(
         self,
         config: Config,
-        llm: LLMClient,
+        services: Services,
         repo: Repository,
+        *,
+        experience_store: Optional[ExperienceStore] = None,
     ) -> None:
         self.config = config
-        self.llm = llm
+        self.services = services
+        self.chat = services.chat
+        self.embedding = services.embedding
         self.repo = repo
+        self.experience_store = experience_store
         # Phase 1 segmentation results kept across induce() calls
         self._segments: list[list[int]] = []
+
+        if experience_store is None:
+            log.info(
+                "HarnessInductor created without ExperienceStore — "
+                "substep discovery will fall back to legacy repo._trajectories path. "
+                "Inject via HarnessInductor(..., experience_store=store)."
+            )
 
     # ==================================================================
     # induction triggers (full-task level + sub-step pattern level)
@@ -128,6 +141,13 @@ class HarnessInductor:
             experiment_id=getattr(self, '_current_experiment_id', '')
         )
         if not patterns:
+            # LEGACY FALLBACK: 直接读 repo._trajectories 做子步骤发现
+            # 新代码应确保注入 ExperienceStore，避免走此路径
+            log.warning(
+                "Substep pattern discovery falling back to legacy path "
+                "(repo._trajectories). Inject an ExperienceStore into "
+                "HarnessInductor to use the substeps table instead."
+            )
             all_trajs = list(self.repo._trajectories.values())
             patterns = self._discover_substep_patterns(all_trajs)
 
@@ -139,13 +159,25 @@ class HarnessInductor:
                 continue
             if p.success_rate < min_success_rate:
                 continue
-            # 贝叶斯权重：成功全任务中的出现比例
+            # 贝叶斯权重（Phase A: 已含预测准确率调整）
             bs = getattr(p, 'bayesian_score', None)
             if bs is not None and bs < min_bayesian_score:
+                log.debug(
+                    "Pattern %s filtered by bayesian score: %.3f < %.3f",
+                    p.intent, bs, min_bayesian_score,
+                )
                 continue
             # pre-filter: 已有 ACTIVE harness 的 pattern 跳过（避免重复归纳）
             if self.repo.active_harnesses_for_type(p.intent):
                 continue
+            # Phase A: 记录预测质量
+            pred_info = ""
+            if p.example_contexts:
+                first_ctx = p.example_contexts[0] if p.example_contexts else ""
+                if "[pred_acc=" in first_ctx:
+                    pred_info = f" {first_ctx}"
+            log.info("Pattern candidate: %s (bs=%.3f, support=%d)%s",
+                     p.intent, bs, p.support_count, pred_info)
             candidates.append(("substep_pattern", p))
 
         return candidates
@@ -158,21 +190,36 @@ class HarnessInductor:
         优先使用此数据源（§2 新架构），因为子步骤是独立一等实体，
         不受全任务成功率限制。
 
+        Phase A（预测契约）：使用 prediction-adjusted Bayesian score 替代
+        原始 bayesian_score，区分高质量经验与侥幸成功。
+
         Args:
             experiment_id: 可选，限定实验范围（避免跨实验污染）。
         """
         try:
-            from experience_os.experience_library import ExperienceLibrary
-            lts = ExperienceLibrary.persistent()
-            rows = lts.aggregate_substep_patterns(
-                experiment_id=experiment_id,
-                min_support=self.config.induction.min_support,
-            )
+            store = self.experience_store
+            if store is not None:
+                rows = store.aggregate_substep_patterns(
+                    experiment_id=experiment_id,
+                    min_support=self.config.induction.min_support,
+                )
+            else:
+                log.debug(
+                    "No ExperienceStore injected — substep discovery skipped. "
+                    "Inject an ExperienceStore via HarnessInductor(experience_store=...)."
+                )
+                return {}
             patterns: dict[str, SubStepPattern] = {}
             for row in rows:
                 intent = row["intent"]
                 tool = row["tool_name"]
                 key = f"{tool}:{intent}"
+
+                # Phase A: 优先使用预测调整后的贝叶斯评分
+                score = row.get("adjusted_bayesian") or row.get("bayesian_score") or 0.0
+                pred_acc = row.get("prediction_accuracy", 1.0)
+                quality_dist = row.get("quality_label_dist", {})
+
                 p = SubStepPattern(
                     intent=intent,
                     action_name=tool,
@@ -180,9 +227,31 @@ class HarnessInductor:
                     success_count=row["success_count"] or 0,
                     success_in_full_tasks=row["success_in_full_tasks"] or 0,
                     total_appearances=row["total_appearances"] or 0,
-                    bayesian_score=row["bayesian_score"] or 0.0,
+                    bayesian_score=score,
                 )
+                # 附加预测质量信息到 example_contexts 用于日志
+                if pred_acc < 1.0 or quality_dist:
+                    qual_summary = (
+                        f"[pred_acc={pred_acc:.2f}, quality={quality_dist}]"
+                    )
+                    if p.example_contexts:
+                        p.example_contexts[0] = qual_summary + " " + p.example_contexts[0]
+                    else:
+                        p.example_contexts.append(qual_summary)
                 patterns[key] = p
+
+            # 日志：报告预测契约对候选模式的影响
+            if patterns and any(
+                row.get("prediction_accuracy", 1.0) < 1.0 for row in rows
+            ):
+                n_adjusted = sum(
+                    1 for row in rows
+                    if row.get("adjusted_bayesian", 0) != row.get("bayesian_score", 0)
+                )
+                log.info(
+                    "Phase A prediction contracts: %d/%d patterns had adjusted scores",
+                    n_adjusted, len(rows),
+                )
             return patterns
         except Exception:
             return {}
@@ -202,12 +271,7 @@ class HarnessInductor:
             return patterns
 
         try:
-            from experience_os.services import EmbeddingService
-            from experience_os.config import Config
-            from experience_os.storage import Storage
-            _cfg = Config()
-            _storage = Storage(_cfg)
-            _embed = EmbeddingService(_cfg.llm, _storage)
+            _embed = self.embedding
         except Exception:
             return patterns
 
@@ -321,7 +385,7 @@ class HarnessInductor:
             example_params=param_lines,
         )
         try:
-            data = self.llm.chat_json([
+            data = self.chat.complete_json([
                 {"role": "system", "content": "You evaluate sub-step patterns for artifact compilation value."},
                 {"role": "user", "content": prompt},
             ])
@@ -353,7 +417,7 @@ class HarnessInductor:
         委托给 :func:`experience_os.compiler.algorithms._segment`，
         并将结果保存到 ``self._segments`` 供下游阶段使用。
         """
-        self._segments = algo._segment(trajectories, self.llm)
+        self._segments = algo._segment(trajectories, self.chat)
         return self._segments
 
     # ==================================================================
@@ -424,7 +488,7 @@ def run():
                 cot_milestones="; ".join(cot.milestones) if cot.milestones else "none",
                 repair_section=repair_section,
             )
-        code = self.llm.chat(
+        code = self.chat.chat(
             [{"role": "system", "content": "You are an expert Python code generator."},
              {"role": "user", "content": prompt}],
             temperature=0.1,

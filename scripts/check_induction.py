@@ -15,7 +15,8 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 from experience_os.config import Config
 from experience_os.repository import Repository
 from experience_os.compiler import HarnessInductor
-from experience_os.llm import LLMClient
+from experience_os.services import Services
+from experience_os.storage import Storage
 from experience_os.environment import MockEnvironment
 from experience_os.tau2_adapter import Tau2Environment, infer_task_type
 from pathlib import Path
@@ -46,8 +47,8 @@ for tt in repo.all_task_types():
     print(f"  {tt}: total={len(trajs)} success={len(success)}")
     print(f"    support_count={repo.support_count(tt)}  min_support={cfg.induction.min_support}")
 
-llm = LLMClient(cfg.llm)
-inductor = HarnessInductor(cfg, llm, repo)
+services = Services.from_config(cfg, Storage(cfg))
+inductor = HarnessInductor(cfg, services, repo)
 for tt in repo.all_task_types():
     trigger = inductor.check_triggers(tt)
     print(f"  check_triggers({tt}) -> {trigger}")

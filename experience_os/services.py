@@ -1,26 +1,7 @@
-"""统一服务层：LLM / Embedding 的单一入口。
+"""统一模型服务层：Chat 和 Embedding 的唯一入口。
 
-所有模块通过 :class:`Services` 依赖注入获取 LLM 和 embedding 能力，
-不再各自创建客户端实例。后续 cost tracking、retry、circuit breaker
-等横切关注点统一在此层实现。
-
-使用方式::
-
-    from experience_os.config import Config
-    from experience_os.storage import Storage
-    from experience_os.services import Services
-
-    config = Config()
-    storage = Storage(config)
-    svc = Services.from_config(config, storage)
-
-    # LLM 调用
-    reply = svc.llm.chat([{"role": "user", "content": "hello"}])
-    data = svc.llm.chat_json([{"role": "user", "content": "{...}"}])
-
-    # Embedding + 意图匹配
-    vec = svc.embed.embed("find user by email")
-    matches = svc.embed.match_intent("find user by email", patterns)
+上层通过 :class:`Services` 获取注入的服务实例；provider 细节只在本模块实现。
+通过 :class:`ProviderRegistry` 管理多个 LLM/Embedding provider 的注册与配置。
 """
 
 from __future__ import annotations
@@ -30,6 +11,7 @@ import json
 import logging
 import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -46,7 +28,7 @@ log = logging.getLogger(__name__)
 
 
 class EmbeddingService:
-    """统一 embedding 服务：多级后端自动降级 + SQLite 缓存。
+    """统一 embedding 服务：多级后端自动降级 + SQLite 缓存，支持单条与批量计算。
 
     后端优先级：
       1. 本地 Qwen3-Embedding-8B（sentence-transformers，GPU 加速）
@@ -82,7 +64,7 @@ class EmbeddingService:
         uncached_texts: list[str] = []
 
         for i, text in enumerate(texts):
-            cached = self._storage.get_embedding(self._hash(text))
+            cached = self._storage.get_embedding(self._cache_text(text))
             if cached is not None:
                 results[i] = cached
             else:
@@ -93,8 +75,9 @@ class EmbeddingService:
             new_vecs = self._compute_batch(uncached_texts)
             for i, vec in zip(uncached_indices, new_vecs):
                 results[i] = vec
+                self._dimension = len(vec)
                 self._storage.save_embedding(
-                    self._hash(texts[i]), vec, self.model_name
+                    self._cache_text(texts[i]), vec, self.model_name
                 )
 
         return results  # type: ignore[return-value]
@@ -268,6 +251,9 @@ class EmbeddingService:
 
     # ── utils ───────────────────────────────────────────────────
 
+    def _cache_text(self, text: str) -> str:
+        return f"{self._config.backend or 'unknown'}/{self.model_name}\n{text}"
+
     @staticmethod
     def _hash(text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -287,17 +273,12 @@ class EmbeddingService:
 # ──────────────────────────────────────────────────────────────────
 
 
-class LLMService:
-    """统一的 LLM 调用层：chat / chat_json / stream，后端切换对调用方透明。
-
-    包装 ``LLMClient`` 并留出 cost tracking / retry / circuit breaker 扩展点。
-    """
+class ChatService:
+    """OpenAI-compatible chat service."""
 
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
-        # 委托到现有 LLMClient（保持兼容）
-        from experience_os.llm import LLMClient
-        self._client = LLMClient(config)
+        self._client = OpenAI(base_url=config.base_url, api_key=config.api_key or "unused")
 
     def chat(
         self,
@@ -305,26 +286,77 @@ class LLMService:
         *,
         response_format: Optional[dict] = None,
         model: Optional[str] = None,
+        temperature: float = 0.3,
+        max_tokens: Optional[int] = None,
+        tools: Optional[list[dict]] = None,
+        tool_choice: Optional[str] = None,
     ) -> str:
-        """单轮对话，返回文本。"""
-        return self._client.chat(messages, response_format=response_format)
+        kwargs: dict[str, Any] = {
+            "model": model or self._config.model,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if response_format:
+            kwargs["response_format"] = response_format
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
+        if tools:
+            kwargs["tools"] = tools
+        if tool_choice:
+            kwargs["tool_choice"] = tool_choice
+        resp = self._client.chat.completions.create(**kwargs)
+        return resp.choices[0].message.content or ""
 
-    def chat_json(
-        self,
-        messages: list[dict[str, str]],
-        *,
-        model: Optional[str] = None,
-    ) -> dict:
-        """JSON 模式对话，返回 dict（含 markdown fence 提取回退）。"""
-        return self._client.chat_json(messages)
+    def complete(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+        return self.chat(messages, **kwargs)
+
+    def complete_json(self, messages: list[dict[str, str]], **kwargs: Any) -> dict:
+        return self.chat_json(messages, **kwargs)
+
+    def chat_json(self, messages: list[dict[str, str]], *, model: Optional[str] = None) -> dict:
+        try:
+            text = self.chat(messages, model=model, temperature=0.2,
+                             response_format={"type": "json_object"})
+        except Exception:
+            text = self.chat(messages, model=model, temperature=0.2)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            block = text.split("```json", 1)[1].split("```", 1)[0] if "```json" in text else text.split("```", 1)[1].split("```", 1)[0]
+            return json.loads(block)
+
+    def tool_call(self, messages: list[dict], tools: list[dict]) -> str:
+        resp = self._client.chat.completions.create(
+            model=self._config.model, messages=messages, tools=tools,
+            tool_choice="auto", temperature=0.3,
+        )
+        msg = resp.choices[0].message
+        if msg.tool_calls:
+            call = msg.tool_calls[0]
+            args = json.loads(call.function.arguments) if call.function.arguments else {}
+            rendered = ", ".join(
+                f'{key}="{value}"' if isinstance(value, str) else f"{key}={value}"
+                for key, value in args.items()
+            )
+            return f"{call.function.name}({rendered})"
+        return msg.content or ""
 
     def stream(self, messages: list[dict[str, str]]) -> Iterator[str]:
-        """流式对话。"""
-        return self._client.stream(messages)
+        stream = self._client.chat.completions.create(
+            model=self._config.model, messages=messages, temperature=0.3, stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
 
     def ping(self) -> bool:
-        """测试 LLM 后端连通性。"""
-        return self._client.ping()
+        try:
+            self.chat([{"role": "user", "content": "ping"}], max_tokens=5)
+            return True
+        except Exception as exc:
+            log.error("LLM ping failed (%s): %s", self._config.backend, exc)
+            return False
 
     @property
     def model(self) -> str:
@@ -348,25 +380,206 @@ class Services:
         inductor = HarnessInductor(svc, repo)
     """
 
-    llm: LLMService
-    embed: EmbeddingService
+    chat: ChatService
+    embedding: EmbeddingService
     config: Config
 
     def __init__(
         self,
-        llm: LLMService,
-        embed: EmbeddingService,
+        chat: ChatService,
+        embedding: EmbeddingService,
         config: Config,
     ) -> None:
-        self.llm = llm
-        self.embed = embed
+        self.chat = chat
+        self.embedding = embedding
         self.config = config
 
     @classmethod
     def from_config(cls, config: Config, storage: Storage) -> "Services":
         """从 Config + Storage 创建完整服务栈。"""
         return cls(
-            llm=LLMService(config.llm),
-            embed=EmbeddingService(config.llm, storage),
+            chat=ChatService(config.llm),
+            embedding=EmbeddingService(config.llm, storage),
             config=config,
         )
+
+    @classmethod
+    def from_provider(cls, provider_name: str, config: Config,
+                      storage: Storage) -> "Services":
+        """从注册的 provider 名称创建服务栈。
+
+        Args:
+            provider_name: 注册的 provider 名称（如 "deepinfra"、"ollama"）。
+            config: Config 对象（provider 信息会被写入 config.llm）。
+            storage: Storage 实例。
+
+        Returns:
+            配置好的 Services 实例。
+        """
+        provider = ProviderRegistry.get(provider_name)
+        if provider is not None:
+            config.llm.backend = provider.name
+            config.llm.base_url = provider.base_url
+            if provider.llm_model:
+                config.llm.model = provider.llm_model
+            if provider.api_key_env:
+                import os
+                key = os.environ.get(provider.api_key_env, "")
+                if key:
+                    config.llm.api_key = key
+            config.llm.embedding_model = (
+                provider.embedding_model or config.llm.embedding_model
+            )
+        return cls.from_config(config, storage)
+
+    @staticmethod
+    def list_providers() -> list[str]:
+        """列出所有已注册的 provider 名称。"""
+        return ProviderRegistry.list_names()
+
+
+# ──────────────────────────────────────────────────────────────────
+# Provider registry
+# ──────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class ProviderInfo:
+    """单个 LLM/Embedding provider 的注册信息。"""
+
+    name: str                           # 短名称（如 "deepinfra"）
+    base_url: str = ""                  # OpenAI-compatible API base URL
+    api_key_env: str = ""               # API key 环境变量名
+    llm_model: str = ""                 # 默认聊天模型
+    embedding_model: str = ""           # 默认 embedding 模型
+    embedding_dimension: int = 1024     # embedding 向量维度
+    description: str = ""               # 人类可读描述
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "base_url": self.base_url,
+            "api_key_env": self.api_key_env,
+            "llm_model": self.llm_model,
+            "embedding_model": self.embedding_model,
+            "embedding_dimension": self.embedding_dimension,
+            "description": self.description,
+        }
+
+
+class ProviderRegistry:
+    """LLM/Embedding provider 注册表。
+
+    用法::
+
+        # 注册新 provider
+        ProviderRegistry.register(ProviderInfo(
+            name="my_provider",
+            base_url="https://api.example.com/v1",
+            api_key_env="MY_API_KEY",
+            llm_model="my-model-v1",
+        ))
+
+        # 按名称获取
+        info = ProviderRegistry.get("deepinfra")
+
+        # 列出全部
+        for name in ProviderRegistry.list_names():
+            print(name)
+    """
+
+    _providers: dict[str, ProviderInfo] = {}
+
+    @classmethod
+    def register(cls, info: ProviderInfo) -> None:
+        """注册一个 provider（同名会覆盖）。"""
+        cls._providers[info.name] = info
+
+    @classmethod
+    def get(cls, name: str) -> Optional[ProviderInfo]:
+        """按名称获取 provider 信息。"""
+        return cls._providers.get(name)
+
+    @classmethod
+    def list_names(cls) -> list[str]:
+        """列出所有已注册的 provider 名称。"""
+        return sorted(cls._providers.keys())
+
+    @classmethod
+    def list_all(cls) -> list[ProviderInfo]:
+        """列出所有已注册的 provider。"""
+        return sorted(cls._providers.values(), key=lambda p: p.name)
+
+    @classmethod
+    def is_registered(cls, name: str) -> bool:
+        """检查 provider 是否已注册。"""
+        return name in cls._providers
+
+    @classmethod
+    def resolve_url(cls, name: str) -> Optional[str]:
+        """解析 provider 的 base URL。"""
+        info = cls.get(name)
+        return info.base_url if info else None
+
+
+# ── 内置 provider 注册 ───────────────────────────────────────────
+
+ProviderRegistry.register(ProviderInfo(
+    name="deepinfra",
+    base_url="https://api.deepinfra.com/v1/openai",
+    api_key_env="DEEPINFRA_TOKEN",
+    llm_model="deepseek-ai/DeepSeek-V4-Flash",
+    embedding_model="Qwen/Qwen3-Embedding-8B",
+    embedding_dimension=1024,
+    description="DeepInfra — serverless LLM + embedding API",
+))
+
+ProviderRegistry.register(ProviderInfo(
+    name="ollama",
+    base_url="http://localhost:11434/v1",
+    api_key_env="",
+    llm_model="qwen2.5:7b",
+    embedding_model="qwen2.5:7b",
+    embedding_dimension=1024,
+    description="Ollama — local LLM + embedding",
+))
+
+ProviderRegistry.register(ProviderInfo(
+    name="openai",
+    base_url="https://api.openai.com/v1",
+    api_key_env="OPENAI_API_KEY",
+    llm_model="gpt-4o",
+    embedding_model="text-embedding-3-small",
+    embedding_dimension=1536,
+    description="OpenAI — GPT + text-embedding",
+))
+
+ProviderRegistry.register(ProviderInfo(
+    name="anthropic",
+    base_url="",
+    api_key_env="ANTHROPIC_API_KEY",
+    llm_model="claude-sonnet-4-20250514",
+    embedding_model="",
+    embedding_dimension=0,
+    description="Anthropic — Claude (no native embedding API; use external)",
+))
+
+ProviderRegistry.register(ProviderInfo(
+    name="local",
+    base_url="http://localhost:11434/v1",
+    api_key_env="",
+    llm_model="qwen2.5:7b",
+    embedding_model="Qwen/Qwen3-Embedding-8B",
+    embedding_dimension=1024,
+    description="Local — Ollama LLM + sentence-transformers embedding (GPU if available)",
+))
+
+ProviderRegistry.register(ProviderInfo(
+    name="litellm",
+    base_url="http://localhost:4000/v1",
+    api_key_env="LITELLM_API_KEY",
+    llm_model="",
+    embedding_model="",
+    embedding_dimension=0,
+    description="LiteLLM proxy — routes to multiple providers",
+))
